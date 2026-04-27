@@ -1,0 +1,44 @@
+# Dependencies
+node_modules/
+
+# Build output
+/dist/
+/build/
+/out/
+*.tsbuildinfo
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+*.log
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Test / coverage
+coverage/
+.nyc_output/
+
+# Runtime / temp
+.tmp/
+tmp/
+cache/
+
+# Tooling caches
+.esbuild/
+.parcel-cache/
+.next/
+.nuxt/
+.svelte-kit/
