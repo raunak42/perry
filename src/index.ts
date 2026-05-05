@@ -1,49 +1,20 @@
 #!/usr/bin/env node
-
 import { Command } from "commander";
-import dotenv from "dotenv";
 import { stdin as input, stdout as output } from "node:process";
 import readline from "node:readline/promises";
 import OpenAI from "openai";
+import { systemPrompt } from "./constants";
+import { getCurrentSessionStatus } from "./helpers/getCurrentSessionStatus";
+import { handleSlashCommands } from "./helpers/handleSlashCommands";
 import { runCommandTool } from "./tools/runCommand";
+import { getCodexResponse, ParsedCodexResponse } from "./helpers/getCodexResponse";
+import type { Response } from "openai/resources/responses/responses";
 
-dotenv.config();
 
 type ChatMessage = {
     role: "user" | "assistant" | "developer";
     content: string;
 };
-
-const systemPrompt = `You are Perry, a CLI-based coding agent.
-
-You can interact with the user's machine by running shell commands using the run_command tool.
-
-Prefer using the shell over guessing.
-
-You are not limited to the current project — you can explore the full filesystem if needed.
-
-Use standard Unix tools to inspect, search, and operate on files.
-
-Think step-by-step and use multiple commands when needed.
-Be concise.
-
-When using web search:
-
-- Only state facts that are clearly supported by the results
-- Do not invent or assume details
-- If details are unclear or conflicting, say so explicitly
-- Prefer quoting or closely paraphrasing reliable sources
-- Always mention the source (e.g., Reuters, AP, BBC)
-- If you are unsure, say "I’m not fully certain based on available information"
-
-Do not present speculation as fact.
-
-Before answering questions involving external information:
-
-- First identify what facts are known from sources
-- Then form the answer strictly from those facts
-It is better to be slightly uncertain than confidently wrong.
-If web_search is used → require citations`.trim();
 
 const program = new Command();
 
@@ -58,23 +29,59 @@ program
 
 program.parse();
 
+export interface State {
+    activeProvider: "openai-api-key" | "openai-codex" | null,
+    client: OpenAI | null,
+}
+
 async function main() {
     const history: ChatMessage[] = [];
-    const systemContext: ChatMessage = { role: "developer", content: systemPrompt }
-
+    const systemContext: ChatMessage = {
+        role: "developer",
+        content: systemPrompt,
+    };
     const rl = readline.createInterface({ input, output });
-    const client = new OpenAI();
+    const localTools = [runCommandTool];
+    const openaiTools: any[] = [
+        ...localTools.map((tool) => tool.definition),
+        { type: "web_search" },
+    ];
 
-    const tools = [runCommandTool, { name: "web_search", definition: { type: "web_search" } }];
+
+    let state: State = {
+        activeProvider: null,
+        client: null
+    }
+    await getCurrentSessionStatus(state)
 
     try {
         while (true) {
             const answer = await rl.question("> ");
-            if (answer.trim() === "/quit") {
-                rl.close();
-                break;
+            const trimmed = answer.trim();
+
+            if (trimmed.startsWith("/")) {
+                const shouldContinue = await handleSlashCommands({ command: trimmed, state, rl });
+                if (shouldContinue === false) {
+                    break;
+                }
+
+                continue;
             }
-            history.push({ role: "user", content: answer });
+
+            if (!state.activeProvider) {
+                console.log("not logged in. Type /login to continue.");
+                continue;
+            }
+
+            if (state.activeProvider === "openai-api-key" && !state.client) {
+                console.log("OpenAI API key client is not available. Run /login again.");
+                continue;
+            }
+
+            history.push({
+                role: "user",
+                content: answer,
+            });
 
             let agentInput: any[] = [
                 systemContext,
@@ -82,30 +89,43 @@ async function main() {
             ];
 
             while (true) {
+                let aiResponse: Response | ParsedCodexResponse;
+                if (state.activeProvider === "openai-api-key") {
+                    if (!state.client) {
+                        throw new Error("OpenAI API key client missing.");
+                    }
 
-                const aiResponse = await client.responses.create({
-                    model: "gpt-5.4-mini",
-                    input: agentInput,
-                    tools: tools.map((t) => t.definition),
-                });
-                console.log(aiResponse.output_text)
-
+                    aiResponse = await (state.client as OpenAI).responses.create({
+                        model: "gpt-5.4-mini",
+                        input: agentInput,
+                        tools: openaiTools,
+                    });
+                } else if (state.activeProvider === "openai-codex") {
+                    aiResponse = await getCodexResponse({
+                        input: history,
+                        tools: openaiTools,
+                        instructions: systemPrompt
+                    });
+                } else {
+                    throw new Error("No active provider.");
+                }
 
                 const responseText = aiResponse.output_text;
-                const toolCall = aiResponse.output.find(o => o.type === "function_call");
+
+                const toolCall = aiResponse.output.find(
+                    (item) => item.type === "function_call"
+                );
 
                 if (toolCall && toolCall.type === "function_call") {
                     const args = JSON.parse(toolCall.arguments);
-                    console.log(args)
 
-                    let toolResult = "";
-                    const tool = tools.find(t => t.name === toolCall.name)
+                    const tool = localTools.find((tool) => tool.name === toolCall.name);
 
                     if (!tool) {
-                        throw new Error(`Unknown tool: ${toolCall.name}`);
+                        throw new Error(`Unknown local tool: ${toolCall.name}`);
                     }
 
-                    toolResult = await tool.execute(args)
+                    const toolResult = await tool.execute(args);
 
                     agentInput = [
                         ...agentInput,
@@ -115,18 +135,20 @@ async function main() {
                             call_id: toolCall.call_id,
                             output: toolResult,
                         },
-                    ]
-                    continue;
-                } else {
-                    history.push({
-                        role: "assistant",
-                        content: responseText,
-                    });
-                    // console.log("history: ", history)
-                    break
-                }
-            }
+                    ];
 
+                    continue;
+                }
+
+                console.log(responseText);
+
+                history.push({
+                    role: "assistant",
+                    content: responseText,
+                });
+
+                break;
+            }
         }
     } catch (err) {
         if ((err as Error).name === "AbortError") {
@@ -135,6 +157,6 @@ async function main() {
             throw err;
         }
     } finally {
-        rl.close()
+        rl.close();
     }
 }
