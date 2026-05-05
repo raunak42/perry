@@ -1,7 +1,7 @@
 import OpenAI from "openai";
 
-export interface Tool {
+export interface Tool<TArgs = unknown> {
     name: string;
     definition: OpenAI.Responses.Tool;
-    execute: (args: unknown) => Promise<string>
+    execute: (args: TArgs) => Promise<string>
 }

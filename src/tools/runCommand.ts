@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { Tool } from "./types";
 
-export const runCommandTool: Tool = {
+export const runCommandTool: Tool<{ command: string }> = {
     name: "run_command",
     definition: {
         type: "function",
@@ -34,7 +34,7 @@ export const runCommandTool: Tool = {
         },
         strict: true,
     },
-    execute: async (args): Promise<string> => {
+    execute: async (args: { command: string }): Promise<string> => {
         return new Promise((resolve) => {
             console.log(`\n$ ${args.command}\n`);
 
