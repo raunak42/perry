@@ -1,12 +1,14 @@
 import fs from "node:fs/promises";
-import type readline from "node:readline/promises";
 import { authDir, authPath } from "../../constants";
 import { AuthFile } from "../../helpers/getAuthFile";
+import type { InteractiveUi } from "../../ui/types";
 
 export async function loginWithApiKey(
-  rl: readline.Interface
+  ui: InteractiveUi
 ): Promise<void> {
-  const apiKey = await rl.question("Paste your OpenAI API key: ");
+  const apiKey = await ui.ask("Paste your OpenAI API key:", {
+    placeholder: "sk-...",
+  });
   const trimmed = apiKey.trim();
 
   if (!trimmed.startsWith("sk-")) {

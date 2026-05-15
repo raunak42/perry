@@ -3,13 +3,14 @@ import fs from "node:fs/promises";
 import { authDir, authPath } from "../../constants";
 import { OpenAICodexTokens } from "../types";
 import { AuthFile } from "../../helpers/getAuthFile";
+import { writeOutput } from "../../ui/output";
 import { CLIENT_ID, createOpenaiLoginUrl } from "./openaiLoginUrl";
 import { waitForOAuthCallback } from "./oAuthCallbackServer";
 
 export async function loginWithSubscription() {
     const login = createOpenaiLoginUrl();
-    console.log("Opening OpenAI login in browser...");
-    console.log(login.url);
+    writeOutput("Opening OpenAI login in browser...");
+    writeOutput(login.url);
 
     const callbackPromise = waitForOAuthCallback(login.state);
 

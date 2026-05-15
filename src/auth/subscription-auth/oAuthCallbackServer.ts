@@ -50,10 +50,6 @@ export function waitForOAuthCallback(expectedState: string): Promise<{ code: str
             res.status(404).send("Not found");
         });
 
-        server = app.listen(oauthCallbackPort, "127.0.0.1", () => {
-            console.log(
-                `Waiting for login callback on http://localhost:${oauthCallbackPort}/auth/callback`
-            );
-        });
+        server = app.listen(oauthCallbackPort, "127.0.0.1");
     });
 }

@@ -1,6 +1,7 @@
 import { OpenAICodexTokens } from "../auth/types";
 import { authPath } from "../constants";
 import fs from "node:fs/promises";
+import { writeOutput } from "../ui/output";
 
 export type AuthFile = {
     activeProvider?: "openai-api-key" | "openai-codex";
@@ -29,12 +30,12 @@ export async function getAuthFile(): Promise<AuthFile | null> {
 
         // Optional - corrupted JSON should be user-friendly, not a stack trace.
         if (err instanceof SyntaxError) {
-            console.log("Auth file is corrupted. Please run /login again.");
+            writeOutput("Auth file is corrupted. Please run /login again.");
             return null;
         }
 
         // Unexpected errors can still be shown.
-        console.log("Could not read auth file. Please run /login again.");
+        writeOutput("Could not read auth file. Please run /login again.");
         return null;
     }
 }
