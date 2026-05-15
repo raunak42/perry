@@ -1,9 +1,11 @@
 import OpenAI from "openai";
 import { getAuthFile } from "./getAuthFile";
-import { State } from "..";
+import { getDefaultContextLevel, getDefaultModel, getDefaultReasoningLevel } from "./models";
+import { writeOutput } from "../ui/output";
+import type { State } from "..";
 
 export const getCurrentSessionStatus = async (state: State) => {
-    console.log("checking session status...");
+    writeOutput("Checking session status...");
     const auth = await getAuthFile();
 
     if (auth?.activeProvider === "openai-api-key" && auth.openaiApiKey) {
@@ -11,13 +13,19 @@ export const getCurrentSessionStatus = async (state: State) => {
             apiKey: auth.openaiApiKey.apiKey,
         });
         state.activeProvider = "openai-api-key";
+        state.currentModel = getDefaultModel("openai-api-key");
+        state.reasoningLevel = getDefaultReasoningLevel();
+        state.contextLevel = getDefaultContextLevel();
 
-        console.log("Using saved OpenAI API key.");
+        writeOutput("Using saved OpenAI API key.");
     } else if (auth?.activeProvider === "openai-codex" && auth.openaiCodex) {
         state.activeProvider = "openai-codex";
-        console.log("Using saved ChatGPT/Codex subscription login.");
+        state.currentModel = getDefaultModel("openai-codex");
+        state.reasoningLevel = getDefaultReasoningLevel();
+        state.contextLevel = getDefaultContextLevel();
+        writeOutput("Using saved ChatGPT/Codex subscription login.");
 
     } else {
-        console.log("Not logged in. Type /login to continue.");
+        writeOutput("Not logged in. Type /login to continue.");
     }
 }
