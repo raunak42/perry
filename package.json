@@ -4,8 +4,13 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "dev": "bun run ./src/index.ts"
+    "test": "bun test ./test",
+    "dev": "bun run ./src/index.ts",
+    "test:terminal-ui": "bun test ./test/terminal-ui.test.ts",
+    "test:formatting": "bun test ./test/terminal-formatting.test.ts",
+    "test:sessions": "bun test ./test/session.test.ts",
+    "test:run-command": "bun test ./test/run-command.test.ts",
+    "test:image-read": "bun test ./test/image-read.test.ts"
   },
   "keywords": [],
   "author": "",
@@ -19,7 +24,6 @@
     "typescript": "^5.9.3"
   },
   "dependencies": {
-    "@opentui/core": "^0.2.2",
     "commander": "^14.0.3",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
