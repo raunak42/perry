@@ -20,6 +20,55 @@ export interface ModelDisplayMetadata {
     maxOutputTokens?: number;
 }
 
+type PerryProvider = "openai-api-key" | "openai-codex";
+
+const PI_MONO_MODEL_METADATA: Record<PerryProvider, Record<string, ModelDisplayMetadata>> = {
+    "openai-api-key": {
+        "gpt-5": { contextWindow: 400_000, maxOutputTokens: 128_000 },
+        "gpt-5-chat-latest": { contextWindow: 128_000, maxOutputTokens: 16_384 },
+        "gpt-5-codex": { contextWindow: 400_000, maxOutputTokens: 128_000 },
+        "gpt-5-mini": { contextWindow: 400_000, maxOutputTokens: 128_000 },
+        "gpt-5-nano": { contextWindow: 400_000, maxOutputTokens: 128_000 },
+        "gpt-5-pro": { contextWindow: 400_000, maxOutputTokens: 272_000 },
+        "gpt-5.1": { contextWindow: 400_000, maxOutputTokens: 128_000 },
+        "gpt-5.1-chat-latest": { contextWindow: 128_000, maxOutputTokens: 16_384 },
+        "gpt-5.1-codex": { contextWindow: 400_000, maxOutputTokens: 128_000 },
+        "gpt-5.1-codex-max": { contextWindow: 400_000, maxOutputTokens: 128_000 },
+        "gpt-5.1-codex-mini": { contextWindow: 400_000, maxOutputTokens: 128_000 },
+        "gpt-5.2": { contextWindow: 400_000, maxOutputTokens: 128_000 },
+        "gpt-5.2-chat-latest": { contextWindow: 128_000, maxOutputTokens: 16_384 },
+        "gpt-5.2-codex": { contextWindow: 400_000, maxOutputTokens: 128_000 },
+        "gpt-5.2-pro": { contextWindow: 400_000, maxOutputTokens: 128_000 },
+        "gpt-5.3-chat-latest": { contextWindow: 128_000, maxOutputTokens: 16_384 },
+        "gpt-5.3-codex": { contextWindow: 400_000, maxOutputTokens: 128_000 },
+        "gpt-5.3-codex-spark": { contextWindow: 128_000, maxOutputTokens: 32_000 },
+        "gpt-5.4": { contextWindow: 272_000, maxOutputTokens: 128_000 },
+        "gpt-5.4-mini": { contextWindow: 400_000, maxOutputTokens: 128_000 },
+        "gpt-5.4-nano": { contextWindow: 400_000, maxOutputTokens: 128_000 },
+        "gpt-5.4-pro": { contextWindow: 1_050_000, maxOutputTokens: 128_000 },
+        "o1": { contextWindow: 200_000, maxOutputTokens: 100_000 },
+        "o1-pro": { contextWindow: 200_000, maxOutputTokens: 100_000 },
+        "o3": { contextWindow: 200_000, maxOutputTokens: 100_000 },
+        "o3-deep-research": { contextWindow: 200_000, maxOutputTokens: 100_000 },
+        "o3-mini": { contextWindow: 200_000, maxOutputTokens: 100_000 },
+        "o3-pro": { contextWindow: 200_000, maxOutputTokens: 100_000 },
+        "o4-mini": { contextWindow: 200_000, maxOutputTokens: 100_000 },
+        "o4-mini-deep-research": { contextWindow: 200_000, maxOutputTokens: 100_000 },
+        "openai": { contextWindow: 200_000, maxOutputTokens: 100_000 },
+    },
+    "openai-codex": {
+        "gpt-5.1-codex-max": { contextWindow: 272_000, maxOutputTokens: 128_000 },
+        "gpt-5.1-codex-mini": { contextWindow: 272_000, maxOutputTokens: 128_000 },
+        "gpt-5.2": { contextWindow: 272_000, maxOutputTokens: 128_000 },
+        "gpt-5.2-codex": { contextWindow: 272_000, maxOutputTokens: 128_000 },
+        "gpt-5.3-codex": { contextWindow: 272_000, maxOutputTokens: 128_000 },
+        "gpt-5.3-codex-spark": { contextWindow: 128_000, maxOutputTokens: 128_000 },
+        "gpt-5.4": { contextWindow: 272_000, maxOutputTokens: 128_000 },
+        "gpt-5.4-mini": { contextWindow: 272_000, maxOutputTokens: 128_000 },
+        "openai-codex": { contextWindow: 272_000, maxOutputTokens: 128_000 },
+    },
+};
+
 export function getDefaultModel(provider: "openai-api-key" | "openai-codex" | null): string {
     if (provider === "openai-codex") {
         return "gpt-5.4";
@@ -173,22 +222,34 @@ export function getContextLevelsForModel(
     return ["disabled", "auto", "balanced", "aggressive"];
 }
 
-export function getModelDisplayMetadata(model: string): ModelDisplayMetadata {
-    if (model === "gpt-5.4" || /^gpt-5\.4-\d{4}-\d{2}-\d{2}$/.test(model)) {
-        return {
-            contextWindow: 1_050_000,
-            maxOutputTokens: 128_000,
-        };
+function normalizeModelId(model: string): string {
+    return model.replace(/-\d{4}-\d{2}-\d{2}$/, "");
+}
+
+export function getModelDisplayMetadata(
+    model: string,
+    provider: "openai-api-key" | "openai-codex" | null = null,
+): ModelDisplayMetadata {
+    const normalized = normalizeModelId(model);
+
+    if (provider) {
+        const exact = PI_MONO_MODEL_METADATA[provider]?.[normalized];
+        if (exact) {
+            return exact;
+        }
     }
 
-    if (
-        model === "gpt-5.4-mini"
-        || /^gpt-5\.4-mini-\d{4}-\d{2}-\d{2}$/.test(model)
-        || model === "gpt-5.4-nano"
-        || /^gpt-5\.4-nano-\d{4}-\d{2}-\d{2}$/.test(model)
-        || model === "gpt-5.5"
-        || /^gpt-5\.5-\d{4}-\d{2}-\d{2}$/.test(model)
-    ) {
+    const apiKeyFallback = PI_MONO_MODEL_METADATA["openai-api-key"][normalized];
+    if (apiKeyFallback) {
+        return apiKeyFallback;
+    }
+
+    const codexFallback = PI_MONO_MODEL_METADATA["openai-codex"][normalized];
+    if (codexFallback) {
+        return codexFallback;
+    }
+
+    if (normalized === "gpt-5.5") {
         return {
             contextWindow: 400_000,
             maxOutputTokens: 128_000,
@@ -213,8 +274,12 @@ export function getContextLevelDescription(level: ContextLevel): string {
     }
 }
 
-export function getContextConfig(model: string, level: ContextLevel): ContextConfig {
-    const metadata = getModelDisplayMetadata(model);
+export function getContextConfig(
+    model: string,
+    level: ContextLevel,
+    provider: "openai-api-key" | "openai-codex" | null = null,
+): ContextConfig {
+    const metadata = getModelDisplayMetadata(model, provider);
 
     if (level === "disabled") {
         return { truncation: "disabled" };
@@ -229,17 +294,7 @@ export function getContextConfig(model: string, level: ContextLevel): ContextCon
         return { truncation: "auto" };
     }
 
-    const compactThreshold = level === "aggressive"
-        ? Math.floor(contextWindow * 0.6)
-        : Math.floor(contextWindow * 0.8);
-
-    return {
-        truncation: "auto",
-        context_management: [{
-            type: "compaction",
-            compact_threshold: compactThreshold,
-        }],
-    };
+    return { truncation: "auto" };
 }
 
 export function getReasoningConfig(level: ReasoningLevel): {

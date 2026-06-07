@@ -10,7 +10,8 @@
     "test:formatting": "bun test ./test/terminal-formatting.test.ts",
     "test:sessions": "bun test ./test/session.test.ts",
     "test:run-command": "bun test ./test/run-command.test.ts",
-    "test:image-read": "bun test ./test/image-read.test.ts"
+    "test:image-read": "bun test ./test/image-read.test.ts",
+    "test:compaction": "bun test ./test/compaction.test.ts"
   },
   "keywords": [],
   "author": "",

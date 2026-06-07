@@ -140,7 +140,7 @@ export async function getCodexResponse(
         throw new Error("No ChatGPT/Codex access token found. Run /login again.");
     }
 
-    const contextConfig = getContextConfig(params.model, params.contextLevel);
+    const contextConfig = getContextConfig(params.model, params.contextLevel, "openai-codex");
     const accountId = getCodexAccountIdFromToken(accessToken);
     const baseBody = {
         model: params.model,
