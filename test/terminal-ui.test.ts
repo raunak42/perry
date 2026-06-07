@@ -1,8 +1,17 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "bun:test";
 import { TerminalUi } from "../src/ui/terminal-ui";
 
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+const RESIZE_SETTLE_DELAY_FOR_TEST_MS = 180;
+const stripAnsi = (text: string) => text.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "");
+
+function emitPromptKey(text: string | undefined, key: Record<string, unknown>): void {
+    process.stdin.emit("keypress", text, key);
+}
 
 async function stream(ui: TerminalUi, variant: "default" | "thinking", chunks: string[], delayMs = 20): Promise<void> {
     const blockId = ui.startStreamingBlock("", variant);
@@ -177,6 +186,219 @@ async function captureTerminalOutput(columns: number, rows: number, run: (ui: Te
     return raw;
 }
 
+async function assertResizeReplaysRetainedHistoryAtNewWidth(): Promise<void> {
+    const message = "This retained history message should wrap at the narrow width and then redraw as one line after resize.";
+    const raw = await captureTerminalOutput(32, 30, async (ui) => {
+        ui.write(message);
+        Object.defineProperty(process.stdout, "columns", { value: 120, configurable: true });
+        (ui as unknown as { redrawRetainedHistoryForResize(): void }).redrawRetainedHistoryForResize();
+    });
+    const replayStart = raw.lastIndexOf("\u001b[?25l\u001b[H\u001b[2J\u001b[3J");
+    assert.notEqual(replayStart, -1);
+    const replay = stripAnsi(raw.slice(replayStart));
+    assert.match(replay, new RegExp(message.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+}
+
+async function assertResizeEventWithoutSizeChangeDoesNotReplayHistory(): Promise<void> {
+    const raw = await captureResizeEventOutput({ initialColumns: 80, initialRows: 24 });
+    assert.equal(raw.includes("\u001b[H\u001b[2J\u001b[3J"), false, "resize event without a real size change should not clear/replay the terminal");
+}
+
+async function assertResizeEventWithHeightOnlyChangeDoesNotReplayHistory(): Promise<void> {
+    const raw = await captureResizeEventOutput({ initialColumns: 80, initialRows: 24, nextColumns: 80, nextRows: 30 });
+    assert.equal(raw.includes("\u001b[H\u001b[2J\u001b[3J"), false, "height-only resize/focus events should not clear/replay scrollback");
+}
+
+async function assertResizeEventWithWidthChangeReplaysRetainedHistory(): Promise<void> {
+    const message = "Width resize event should reflow this retained history message at the wider terminal width.";
+    const raw = await captureResizeEventOutput({
+        initialColumns: 32,
+        initialRows: 24,
+        nextColumns: 120,
+        nextRows: 24,
+        setup: async (ui) => {
+            ui.write(message);
+        },
+    });
+    const replayStart = raw.lastIndexOf("\u001b[?25l\u001b[H\u001b[2J\u001b[3J");
+    assert.notEqual(replayStart, -1, "true width changes should replay retained history so old blocks reflow");
+    const replay = stripAnsi(raw.slice(replayStart));
+    assert.match(replay, new RegExp(message.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+}
+
+async function captureResizeEventOutput(options: { initialColumns: number; initialRows: number; nextColumns?: number; nextRows?: number; setup?: (ui: TerminalUi) => Promise<void> | void }): Promise<string> {
+    let raw = "";
+    const originalWrite = process.stdout.write.bind(process.stdout);
+    const isTTYDescriptor = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+    const columnsDescriptor = Object.getOwnPropertyDescriptor(process.stdout, "columns");
+    const rowsDescriptor = Object.getOwnPropertyDescriptor(process.stdout, "rows");
+    try {
+        (process.stdout as unknown as { write: typeof process.stdout.write }).write = ((chunk: unknown, encoding?: unknown, callback?: unknown) => {
+            raw += Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk);
+            if (typeof encoding === "function") encoding();
+            if (typeof callback === "function") callback();
+            return true;
+        }) as typeof process.stdout.write;
+        Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
+        Object.defineProperty(process.stdout, "columns", { value: options.initialColumns, configurable: true });
+        Object.defineProperty(process.stdout, "rows", { value: options.initialRows, configurable: true });
+
+        const ui = await TerminalUi.create();
+        const prompt = ui.ask(">", { placeholder: "Type a message" }).catch(() => undefined);
+        try {
+            await wait(1);
+            if (options.setup) await options.setup(ui);
+            if (options.nextColumns !== undefined) Object.defineProperty(process.stdout, "columns", { value: options.nextColumns, configurable: true });
+            if (options.nextRows !== undefined) Object.defineProperty(process.stdout, "rows", { value: options.nextRows, configurable: true });
+            process.stdout.emit("resize");
+            await wait(RESIZE_SETTLE_DELAY_FOR_TEST_MS);
+            ui.cancelActiveInput();
+            await prompt;
+        } finally {
+            ui.destroy();
+        }
+    } finally {
+        if (isTTYDescriptor) Object.defineProperty(process.stdout, "isTTY", isTTYDescriptor);
+        else delete (process.stdout as unknown as { isTTY?: boolean }).isTTY;
+        (process.stdout as unknown as { write: typeof process.stdout.write }).write = originalWrite as typeof process.stdout.write;
+        if (columnsDescriptor) Object.defineProperty(process.stdout, "columns", columnsDescriptor);
+        else delete (process.stdout as unknown as { columns?: number }).columns;
+        if (rowsDescriptor) Object.defineProperty(process.stdout, "rows", rowsDescriptor);
+        else delete (process.stdout as unknown as { rows?: number }).rows;
+    }
+    return raw;
+}
+
+async function assertRefreshHistoryDropsUnretainedStreamingBlocks(): Promise<void> {
+    const retained = "Retained transcript content should survive redraw.";
+    const transient = "Temporary tool-planning chatter should disappear after redraw.";
+    const raw = await captureTerminalOutput(80, 20, async (ui) => {
+        ui.write(retained);
+        const blockId = ui.startStreamingBlock();
+        ui.appendToStreamingBlock(blockId, transient);
+        ui.finishStreamingBlock(blockId, { retain: false });
+        ui.refreshHistory();
+    });
+    const replayStart = raw.lastIndexOf("\u001b[?25l\u001b[H\u001b[2J\u001b[3J");
+    assert.notEqual(replayStart, -1);
+    const replay = stripAnsi(raw.slice(replayStart));
+    assert.match(replay, new RegExp(retained.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.equal(replay.includes(transient), false);
+}
+
+async function assertStartupAnsiPreviewIsCenteredAtNativeSize(): Promise<void> {
+    const tempDir = mkdtempSync(join(tmpdir(), "perry-ansi-"));
+    try {
+        const ansiPath = join(tempDir, "preview.ansi");
+        const source = Array.from({ length: 10 }, (_, index) => `ROW${index}ABCDEFGHIJ`).join("\n");
+        writeFileSync(ansiPath, source);
+        const raw = await captureTerminalOutput(80, 30, async (ui) => {
+            ui.writeStartupCard({
+                title: "Perry",
+                ansiImagePath: ansiPath,
+                lines: [],
+            });
+        });
+        assert.doesNotMatch(raw, /ANSI image preview/);
+        assert.doesNotMatch(raw, /Startup image/);
+        assert.match(raw, /ROW0ABCDEFGHIJ/);
+        const plain = stripAnsi(raw);
+        assert.match(plain, /│ {30}ROW0ABCDEFGHIJ {31}│/);
+        assert.match(plain, /│ {30}ROW1ABCDEFGHIJ {31}│/);
+    } finally {
+        rmSync(tempDir, { recursive: true, force: true });
+    }
+}
+
+async function assertPromptShiftTabCyclesReasoningLevel(): Promise<void> {
+    let cycles = 0;
+    await captureTerminalOutput(80, 20, async (ui) => {
+        const prompt = ui.ask(">", {
+            placeholder: "Type a message",
+            onCycleReasoningLevel: () => {
+                cycles += 1;
+                ui.setReasoningLevel(cycles % 2 === 0 ? "high" : "low");
+                return "low";
+            },
+        });
+        await wait(1);
+        emitPromptKey("", { name: "tab", shift: true, sequence: "\u001b[Z" });
+        await wait(1);
+        emitPromptKey("", { name: "return" });
+        const answer = await prompt;
+        assert.equal(answer, "");
+    });
+
+    assert.equal(cycles, 1);
+}
+
+async function assertPromptUpDownNavigatesHistory(): Promise<void> {
+    await captureTerminalOutput(80, 20, async (ui) => {
+        const prompt = ui.ask(">", {
+            placeholder: "Type a message",
+            history: ["first previous", "second previous"],
+        });
+        await wait(1);
+        emitPromptKey("", { name: "up" });
+        await wait(1);
+        emitPromptKey("", { name: "return" });
+        assert.equal(await prompt, "second previous");
+    });
+
+    await captureTerminalOutput(80, 20, async (ui) => {
+        const prompt = ui.ask(">", {
+            placeholder: "Type a message",
+            history: ["first previous", "second previous"],
+        });
+        await wait(1);
+        emitPromptKey("draft", {});
+        emitPromptKey("", { name: "up" });
+        emitPromptKey("", { name: "down" });
+        emitPromptKey("", { name: "return" });
+        assert.equal(await prompt, "draft");
+    });
+}
+
+async function assertPromptUpMovesWithinWrappedDraftBeforeHistory(): Promise<void> {
+    const draft = "alpha beta gamma delta epsilon zeta eta theta";
+    await captureTerminalOutput(24, 20, async (ui) => {
+        const prompt = ui.ask(">", {
+            placeholder: "Type a message",
+            history: ["previous message"],
+        });
+        await wait(1);
+        emitPromptKey(draft, {});
+        await wait(1);
+        emitPromptKey("", { name: "up" });
+        await wait(1);
+        emitPromptKey("", { name: "return" });
+        assert.equal(await prompt, draft);
+    });
+}
+
+async function assertPromptBracketedPastePreservesMultilineTextWithoutSubmitting(): Promise<void> {
+    await captureTerminalOutput(80, 20, async (ui) => {
+        const prompt = ui.ask(">", { placeholder: "Type a message" });
+        let resolved = false;
+        prompt.then(() => { resolved = true; }).catch(() => undefined);
+
+        await wait(1);
+        emitPromptKey(undefined, { name: "paste-start", sequence: "\u001b[200~" });
+        emitPromptKey("first line", {});
+        emitPromptKey("\r", { name: "return", sequence: "\r" });
+        emitPromptKey("\n", { name: "enter", sequence: "\n" });
+        emitPromptKey("second line", {});
+        emitPromptKey("\r", { name: "return", sequence: "\r" });
+        emitPromptKey("third line", {});
+        emitPromptKey(undefined, { name: "paste-end", sequence: "\u001b[201~" });
+
+        await wait(5);
+        assert.equal(resolved, false, "pasted newlines should not submit the prompt");
+        emitPromptKey("", { name: "return" });
+        assert.equal(await prompt, "first line\nsecond line\nthird line");
+    });
+}
+
 async function assertReadTraceUsesPiMonoStyleCard(): Promise<void> {
     const raw = await captureTerminalOutput(100, 12, async (ui) => {
         ui.showToolCall("read-trace", "read", { path: "src/tools/readFile.ts", offset: 1, limit: 3 }, "complete", "ok", {
@@ -291,6 +513,28 @@ async function assertStaleToolOutputDoesNotAppendDuplicateCards(): Promise<void>
     assert.equal(raw.includes("trace 1 output"), false, "stale tool output appended duplicate cards");
 }
 
+async function assertRunningToolElapsedUpdatesLive(): Promise<void> {
+    const originalDateNow = Date.now;
+    let now = originalDateNow();
+    Date.now = () => now;
+    try {
+        const raw = await captureTerminalOutput(100, 12, async (ui) => {
+            ui.showToolCall("live-shell-time", "run_command", { command: "sleep 10" }, "pending", "", {
+                type: "local_shell",
+                command: "sleep 10",
+            });
+            ui.startToolExecution("live-shell-time");
+            await wait(120);
+            now += 3_400;
+            await wait(120);
+        });
+        assert.match(stripAnsi(raw), /Running · 0\.0s/);
+        assert.match(stripAnsi(raw), /Running · 3\.4s/);
+    } finally {
+        Date.now = originalDateNow;
+    }
+}
+
 async function assertNumberedListMarkerDoesNotSplitAcrossStreamingBoundary(): Promise<void> {
     const raw = await captureTerminalOutput(120, 13, async (ui) => {
         ui.setBusy("Working");
@@ -310,6 +554,73 @@ async function assertNumberedListMarkerDoesNotSplitAcrossStreamingBoundary(): Pr
     const screen = emulateTerminalFinalScreen(raw, 120);
     assert.match(screen, /4\. Final status/);
     assert.equal(/\n4\s*\n\. Final status/.test(screen), false, "numbered list marker was rendered before it was stable");
+}
+
+async function assertInlineMarkdownDelimitersDoNotLeakAcrossStreamingBoundary(): Promise<void> {
+    const raw = await captureTerminalOutput(140, 10, async (ui) => {
+        const blockId = ui.startStreamingBlock();
+        ui.appendToStreamingBlock(blockId, "Yes — **");
+        await wait(1);
+        ui.appendToStreamingBlock(blockId, "in the important user-facing way, it’s meant to be like Pi Mono**:");
+        await wait(1);
+        ui.finishStreamingBlock(blockId);
+    });
+
+    const screen = stripAnsi(emulateTerminalFinalScreen(raw, 140));
+    assert.match(screen, /Yes — in the important user-facing way, it’s meant to be like Pi Mono:/);
+    assert.equal(screen.includes("**"), false, "bold marker leaked across streaming boundary");
+}
+
+async function assertInlineCodeDelimitersDoNotLeakAcrossStreamingBoundary(): Promise<void> {
+    const raw = await captureTerminalOutput(100, 10, async (ui) => {
+        const blockId = ui.startStreamingBlock();
+        ui.appendToStreamingBlock(blockId, "Use `");
+        await wait(1);
+        ui.appendToStreamingBlock(blockId, "bun test` now.");
+        await wait(1);
+        ui.finishStreamingBlock(blockId);
+    });
+
+    const screen = stripAnsi(emulateTerminalFinalScreen(raw, 100));
+    assert.match(screen, /Use bun test now\./);
+    assert.equal(screen.includes("`"), false, "inline code marker leaked across streaming boundary");
+}
+
+async function assertPlainChunksStreamImmediately(): Promise<void> {
+    const originalWrite = process.stdout.write.bind(process.stdout);
+    const columnsDescriptor = Object.getOwnPropertyDescriptor(process.stdout, "columns");
+    const rowsDescriptor = Object.getOwnPropertyDescriptor(process.stdout, "rows");
+    let raw = "";
+    (process.stdout as unknown as { write: typeof process.stdout.write }).write = ((chunk: unknown, encoding?: unknown, callback?: unknown) => {
+        raw += Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk);
+        if (typeof encoding === "function") encoding();
+        if (typeof callback === "function") callback();
+        return true;
+    }) as typeof process.stdout.write;
+    Object.defineProperty(process.stdout, "columns", { value: 88, configurable: true });
+    Object.defineProperty(process.stdout, "rows", { value: 18, configurable: true });
+
+    const ui = await TerminalUi.create();
+    try {
+        const blockId = ui.startStreamingBlock();
+        for (const chunk of ["Hello ", "world ", "this ", "streams."]) {
+            const before = raw.length;
+            ui.appendToStreamingBlock(blockId, chunk);
+            assert.ok(raw.length > before, `chunk ${JSON.stringify(chunk)} did not write immediately`);
+        }
+        ui.finishStreamingBlock(blockId);
+        ui.destroy();
+    } finally {
+        ui.cancelActiveInput();
+        (process.stdout as unknown as { write: typeof process.stdout.write }).write = originalWrite as typeof process.stdout.write;
+        if (columnsDescriptor) Object.defineProperty(process.stdout, "columns", columnsDescriptor);
+        else delete (process.stdout as unknown as { columns?: number }).columns;
+        if (rowsDescriptor) Object.defineProperty(process.stdout, "rows", rowsDescriptor);
+        else delete (process.stdout as unknown as { rows?: number }).rows;
+    }
+
+    const screen = emulateTerminalFinalScreen(raw, 88);
+    assert.match(screen, /Hello world this streams\./);
 }
 
 async function assertActivePromptBusyStreamFlushesSafely(): Promise<void> {
@@ -353,6 +664,209 @@ async function assertActivePromptBusyStreamFlushesSafely(): Promise<void> {
     const screen = emulateTerminalFinalScreen(raw, 88);
     assert.match(screen, /Hello this is/);
     assert.match(screen, /a long streaming paragraph with no markdown boundary until the final end\./);
+}
+
+async function assertActivePromptStreamingRestoresInputFrame(): Promise<void> {
+    const originalWrite = process.stdout.write.bind(process.stdout);
+    const columnsDescriptor = Object.getOwnPropertyDescriptor(process.stdout, "columns");
+    const rowsDescriptor = Object.getOwnPropertyDescriptor(process.stdout, "rows");
+    let raw = "";
+    const writes: string[] = [];
+    (process.stdout as unknown as { write: typeof process.stdout.write }).write = ((chunk: unknown, encoding?: unknown, callback?: unknown) => {
+        const text = Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk);
+        raw += text;
+        writes.push(text);
+        if (typeof encoding === "function") encoding();
+        if (typeof callback === "function") callback();
+        return true;
+    }) as typeof process.stdout.write;
+    Object.defineProperty(process.stdout, "columns", { value: 88, configurable: true });
+    Object.defineProperty(process.stdout, "rows", { value: 18, configurable: true });
+
+    const ui = await TerminalUi.create();
+    const prompt = ui.ask(">", { placeholder: "Type a message" }).catch(() => undefined);
+    let screenBeforeCleanup = "";
+    try {
+        await wait(1);
+        ui.setBusy("Thinking");
+        await wait(1);
+        const blockId = ui.startStreamingBlock();
+        for (const chunk of [
+            "This ", "is ", "a ", "streaming ", "fixture ", "with ", "many ", "small ", "chunks ", "while ", "the ", "prompt ", "is ", "active.",
+        ]) {
+            ui.appendToStreamingBlock(blockId, chunk);
+            await wait(1);
+        }
+        ui.finishStreamingBlock(blockId);
+        screenBeforeCleanup = emulateTerminalFinalScreen(raw, 88);
+        ui.clearBusy();
+        ui.cancelActiveInput();
+        await prompt;
+        ui.destroy();
+    } finally {
+        ui.cancelActiveInput();
+        (process.stdout as unknown as { write: typeof process.stdout.write }).write = originalWrite as typeof process.stdout.write;
+        if (columnsDescriptor) Object.defineProperty(process.stdout, "columns", columnsDescriptor);
+        else delete (process.stdout as unknown as { columns?: number }).columns;
+        if (rowsDescriptor) Object.defineProperty(process.stdout, "rows", rowsDescriptor);
+        else delete (process.stdout as unknown as { rows?: number }).rows;
+    }
+
+    const promptFrameWrites = writes.filter((write) => write.includes("─".repeat(8)) && write.includes("Type a message")).length;
+    assert.ok(promptFrameWrites > 0, "streaming did not restore the active prompt frame");
+    assert.match(screenBeforeCleanup, /This is a streaming fixture with many small chunks while the prompt is active\./);
+    assert.match(screenBeforeCleanup, /Type a message/);
+}
+
+async function assertActivePromptBusySpinnerDoesNotRedrawPromptEveryTick(): Promise<void> {
+    const originalWrite = process.stdout.write.bind(process.stdout);
+    const columnsDescriptor = Object.getOwnPropertyDescriptor(process.stdout, "columns");
+    const rowsDescriptor = Object.getOwnPropertyDescriptor(process.stdout, "rows");
+    let raw = "";
+    const writes: string[] = [];
+    (process.stdout as unknown as { write: typeof process.stdout.write }).write = ((chunk: unknown, encoding?: unknown, callback?: unknown) => {
+        const text = Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk);
+        raw += text;
+        writes.push(text);
+        if (typeof encoding === "function") encoding();
+        if (typeof callback === "function") callback();
+        return true;
+    }) as typeof process.stdout.write;
+    Object.defineProperty(process.stdout, "columns", { value: 88, configurable: true });
+    Object.defineProperty(process.stdout, "rows", { value: 18, configurable: true });
+
+    const ui = await TerminalUi.create();
+    const prompt = ui.ask(">", { placeholder: "Type a message" }).catch(() => undefined);
+    try {
+        await wait(1);
+        ui.setSessionDetails([
+            { left: "~/repos/new-projects/perry-new (main)" },
+            { left: "context [46%/400k]", right: "gpt-5.4 · high" },
+        ]);
+        ui.setBusy("Thinking");
+        await wait(350);
+        ui.clearBusy();
+        ui.cancelActiveInput();
+        await prompt;
+        ui.destroy();
+    } finally {
+        ui.cancelActiveInput();
+        (process.stdout as unknown as { write: typeof process.stdout.write }).write = originalWrite as typeof process.stdout.write;
+        if (columnsDescriptor) Object.defineProperty(process.stdout, "columns", columnsDescriptor);
+        else delete (process.stdout as unknown as { columns?: number }).columns;
+        if (rowsDescriptor) Object.defineProperty(process.stdout, "rows", rowsDescriptor);
+        else delete (process.stdout as unknown as { rows?: number }).rows;
+    }
+
+    const promptFrameWrites = writes.filter((write) => write.includes("─".repeat(8)) && write.includes("Type a message")).length;
+    const sessionLineWrites = writes.filter((write) => write.includes("context [46%/400k]")).length;
+    const clearTailCount = (raw.match(/\u001b\[J/g) ?? []).length;
+    assert.ok(promptFrameWrites <= 5, `busy spinner redrew prompt frame too often: ${promptFrameWrites}`);
+    assert.ok(sessionLineWrites <= 4, `busy spinner redrew session metadata too often: ${sessionLineWrites}`);
+    assert.ok(clearTailCount <= 5, `busy spinner cleared terminal tail too often: ${clearTailCount}`);
+}
+
+async function assertActivePromptBusyTimerAdvancesWhileInputActive(): Promise<void> {
+    const originalWrite = process.stdout.write.bind(process.stdout);
+    const originalDateNow = Date.now;
+    const columnsDescriptor = Object.getOwnPropertyDescriptor(process.stdout, "columns");
+    const rowsDescriptor = Object.getOwnPropertyDescriptor(process.stdout, "rows");
+    let raw = "";
+    let now = originalDateNow();
+    Date.now = () => now;
+    (process.stdout as unknown as { write: typeof process.stdout.write }).write = ((chunk: unknown, encoding?: unknown, callback?: unknown) => {
+        const text = Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk);
+        raw += text;
+        if (typeof encoding === "function") encoding();
+        if (typeof callback === "function") callback();
+        return true;
+    }) as typeof process.stdout.write;
+    Object.defineProperty(process.stdout, "columns", { value: 88, configurable: true });
+    Object.defineProperty(process.stdout, "rows", { value: 18, configurable: true });
+
+    const ui = await TerminalUi.create();
+    const prompt = ui.ask(">", { placeholder: "Type a message" }).catch(() => undefined);
+    try {
+        await wait(1);
+        ui.setBusy("Thinking");
+        await wait(120);
+        now += 1_000;
+        await wait(120);
+        now += 64_000;
+        ui.setSessionDetails([{ left: "timer refresh" }]);
+        await wait(1);
+        ui.clearBusy();
+        ui.cancelActiveInput();
+        await prompt;
+        ui.destroy();
+    } finally {
+        ui.cancelActiveInput();
+        Date.now = originalDateNow;
+        (process.stdout as unknown as { write: typeof process.stdout.write }).write = originalWrite as typeof process.stdout.write;
+        if (columnsDescriptor) Object.defineProperty(process.stdout, "columns", columnsDescriptor);
+        else delete (process.stdout as unknown as { columns?: number }).columns;
+        if (rowsDescriptor) Object.defineProperty(process.stdout, "rows", rowsDescriptor);
+        else delete (process.stdout as unknown as { rows?: number }).rows;
+    }
+
+    assert.match(raw, /Thinking · 0s/);
+    assert.match(raw, /Thinking · 1s/);
+    assert.match(raw, /Thinking · 1m 5s/);
+}
+
+async function assertActivePromptSlowStreamingKeepsSessionDetailsVisible(): Promise<void> {
+    const originalWrite = process.stdout.write.bind(process.stdout);
+    const columnsDescriptor = Object.getOwnPropertyDescriptor(process.stdout, "columns");
+    const rowsDescriptor = Object.getOwnPropertyDescriptor(process.stdout, "rows");
+    let raw = "";
+    const writes: string[] = [];
+    (process.stdout as unknown as { write: typeof process.stdout.write }).write = ((chunk: unknown, encoding?: unknown, callback?: unknown) => {
+        const text = Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk);
+        raw += text;
+        writes.push(text);
+        if (typeof encoding === "function") encoding();
+        if (typeof callback === "function") callback();
+        return true;
+    }) as typeof process.stdout.write;
+    Object.defineProperty(process.stdout, "columns", { value: 88, configurable: true });
+    Object.defineProperty(process.stdout, "rows", { value: 18, configurable: true });
+
+    const ui = await TerminalUi.create();
+    const prompt = ui.ask(">", { placeholder: "Type a message" }).catch(() => undefined);
+    let screenBeforeCleanup = "";
+    try {
+        await wait(1);
+        ui.setSessionDetails([
+            { left: "~/repos/new-projects/perry-new (main)" },
+            { left: "context [46%/400k]", right: "gpt-5.4 · high" },
+        ]);
+        ui.setBusy("Thinking");
+        const blockId = ui.startStreamingBlock();
+        for (const chunk of ["Slow ", "streaming ", "chunks ", "should ", "not ", "flash."]) {
+            ui.appendToStreamingBlock(blockId, chunk);
+            await wait(95);
+        }
+        ui.finishStreamingBlock(blockId);
+        screenBeforeCleanup = emulateTerminalFinalScreen(raw, 88);
+        ui.clearBusy();
+        ui.cancelActiveInput();
+        await prompt;
+        ui.destroy();
+    } finally {
+        ui.cancelActiveInput();
+        (process.stdout as unknown as { write: typeof process.stdout.write }).write = originalWrite as typeof process.stdout.write;
+        if (columnsDescriptor) Object.defineProperty(process.stdout, "columns", columnsDescriptor);
+        else delete (process.stdout as unknown as { columns?: number }).columns;
+        if (rowsDescriptor) Object.defineProperty(process.stdout, "rows", rowsDescriptor);
+        else delete (process.stdout as unknown as { rows?: number }).rows;
+    }
+
+    const sessionLineWrites = writes.filter((write) => write.includes("context [46%/400k]")).length;
+    assert.ok(sessionLineWrites > 0, "slow streaming did not restore session metadata");
+    for (const word of ["Slow", "streaming", "chunks", "should", "not", "flash."]) {
+        assert.match(raw, new RegExp(word.replace(".", "\\.")));
+    }
+    assert.match(screenBeforeCleanup, /context \[46%\/400k\]/);
 }
 
 async function assertCumulativeSnapshotDeltasDoNotPrintRepeatedPrefixes(): Promise<void> {
@@ -462,12 +976,173 @@ async function assertChoiceFrameAlignsSessionMetadataOnTheRightWhenWidthAllows()
     const normalizedLines = transcript.split("\n").map((line) => line.trimEnd());
     const selectedInlineLine = normalizedLines.find((line) => line.includes("feat-session-compaction"));
     const unselectedInlineLine = normalizedLines.find((line) => line.includes("fix-terminal-picker-layout"));
-    assert.ok(selectedInlineLine && /› feat-session-compaction\s{3,}current · 124 messages · 5m ago$/.test(selectedInlineLine));
-    assert.ok(unselectedInlineLine && /^\s{2}fix-terminal-picker-layout\s{3,}all · d34db33f · 41 messages · ~\/repo · 1h ago$/.test(unselectedInlineLine));
+    assert.ok(selectedInlineLine && /^\s+› feat-session-compaction\s{3,}current · 124 messages · 5m ago$/.test(selectedInlineLine));
+    assert.ok(unselectedInlineLine && /^\s{3}fix-terminal-picker-layout\s{3,}all · d34db33f · 41 messages · ~\/repo · 1h ago$/.test(unselectedInlineLine));
     assert.equal(
         transcript.includes("\n    current · 124 messages · 5m ago") || transcript.includes("\n    all · d34db33f · 41 messages · ~/repo · 1h ago"),
         false,
     );
+}
+
+async function assertChoiceFrameStylesSelectedOptionTurquoiseBold(): Promise<void> {
+    const selectedAnsi = "\u001b[1;38;2;72;209;204m";
+    const raw = await captureTerminalOutput(80, 12, async (ui) => {
+        const choice = ui.choose("Choose approach", [
+            {
+                label: "Recommended",
+                value: "recommended",
+                description: "fast path",
+            },
+            {
+                label: "Conservative",
+                value: "conservative",
+                description: "slower but safer",
+            },
+        ]);
+        await wait(5);
+        ui.cancelActiveInput();
+        await choice.catch(() => undefined);
+    });
+
+    assert.ok(raw.includes(`${selectedAnsi}› Recommended`), "selected label should be bold turquoise");
+    assert.ok(raw.includes("fast path"), "selected inline description should render");
+    assert.equal(raw.includes(`${selectedAnsi}  Conservative`), false, "unselected label should not use selected turquoise style");
+}
+
+async function assertChoiceFrameStylesSelectedWrappedDescriptionTurquoiseBold(): Promise<void> {
+    const selectedAnsi = "\u001b[1;38;2;72;209;204m";
+    const raw = await captureTerminalOutput(40, 12, async (ui) => {
+        const choice = ui.choose("Choose approach", [
+            {
+                label: "Recommended path",
+                value: "recommended",
+                description: "Ask focused questions first",
+            },
+            {
+                label: "Conservative path",
+                value: "conservative",
+                description: "Inspect more before changing anything",
+            },
+        ]);
+        await wait(5);
+        ui.cancelActiveInput();
+        await choice.catch(() => undefined);
+    });
+
+    assert.ok(raw.includes(`${selectedAnsi}› Recommended path`), "selected label should be bold turquoise");
+    assert.ok(raw.includes(`${selectedAnsi}    Ask focused questions first`), "selected wrapped description should be bold turquoise");
+    assert.equal(raw.includes(`${selectedAnsi}  Conservative path`), false, "unselected label should not use selected turquoise style");
+}
+
+async function assertChoiceFrameUsesCompactOnePixelApproximation(): Promise<void> {
+    const rowBackgroundAnsi = "\u001b[48;2;31;31;31m";
+    const raw = await captureTerminalOutput(80, 14, async (ui) => {
+        const choice = ui.choose("Permission required", [
+            { label: "Allow once", value: "allow_once", description: "Run only this action" },
+            { label: "Deny", value: "deny", description: "Do not run this action" },
+            { label: "Full access / YOLO mode", value: "full-access", description: "Auto-approve future prompts" }
+        ]);
+        await wait(5);
+        ui.cancelActiveInput();
+        await choice.catch(() => undefined);
+    });
+    const transcript = stripAnsi(raw).replace(/\r/g, "\n");
+    assert.match(transcript, /› Allow once[^\n]*Run only this action[ \t]*\n[ \t]*Deny[^\n]*Do not run this action[ \t]*\n[ \t]*Full access \/ YOLO mode/, "options should use the most compact terminal-row approximation of 1px vertical padding");
+    assert.equal(/› Allow once[^\n]*Run only this action[ \t]*\n[ \t]*\n[ \t]*Deny/.test(transcript), false, "options should not add full blank terminal-row padding");
+    assert.ok(raw.includes(rowBackgroundAnsi), "selected option row should still use the selected row background");
+}
+
+async function assertChoiceFrameWindowsLongOptionListsWithIndicator(): Promise<void> {
+    const raw = await captureTerminalOutput(80, 24, async (ui) => {
+        const choice = ui.choose("Select model", Array.from({ length: 60 }, (_, index) => ({
+            label: `model-${index + 1}`,
+            value: index + 1,
+            description: "provider",
+        })), 6);
+        await wait(5);
+        ui.cancelActiveInput();
+        await choice.catch(() => undefined);
+    });
+    const transcript = stripAnsi(raw);
+    assert.ok(transcript.includes("model-1"));
+    assert.ok(transcript.includes("model-10"));
+    assert.equal(transcript.includes("model-11"), false, "long choice frame should not show all options at once");
+    assert.ok(transcript.includes("(6/60)"), "long choice frame should show selected position indicator");
+}
+
+async function assertBareSlashShowsWindowedCommandSuggestionsWithIndicator(): Promise<void> {
+    const raw = await captureTerminalOutput(90, 40, async (ui) => {
+        const prompt = ui.ask(">", { placeholder: "Type a message" }).catch(() => undefined);
+        await wait(1);
+        emitPromptKey("/", {});
+        await wait(5);
+        ui.cancelActiveInput();
+        await prompt;
+    });
+    const transcript = stripAnsi(raw);
+    for (const command of ["/help", "/login", "/logout", "/model", "/thinking", "/settings", "/permissions", "/mcp", "/skills", "/skill"]) {
+        assert.ok(transcript.includes(command), `missing visible slash command suggestion ${command}`);
+    }
+    assert.equal(transcript.includes("/plan"), false, "bare slash should not show every command at once");
+    assert.ok(transcript.includes("(1/19)"), "bare slash suggestions should show the selected position indicator");
+}
+
+async function assertSlashCommandSuggestionWindowScrollsWithSelection(): Promise<void> {
+    const raw = await captureTerminalOutput(90, 40, async (ui) => {
+        const prompt = ui.ask(">", { placeholder: "Type a message" }).catch(() => undefined);
+        await wait(1);
+        emitPromptKey("/", {});
+        for (let index = 0; index < 10; index += 1) {
+            emitPromptKey("", { name: "down" });
+        }
+        await wait(5);
+        ui.cancelActiveInput();
+        await prompt;
+    });
+    const transcript = stripAnsi(raw);
+    assert.ok(transcript.includes("/plan"), "window should scroll to later commands as selection moves");
+    assert.ok(transcript.includes("(11/19)"), "indicator should update with the selected slash command index");
+}
+
+async function assertPromptRendersRepoAndContextMetadataBelowInput(): Promise<void> {
+    const originalWrite = process.stdout.write.bind(process.stdout);
+    const columnsDescriptor = Object.getOwnPropertyDescriptor(process.stdout, "columns");
+    const rowsDescriptor = Object.getOwnPropertyDescriptor(process.stdout, "rows");
+    let raw = "";
+    (process.stdout as unknown as { write: typeof process.stdout.write }).write = ((chunk: unknown, encoding?: unknown, callback?: unknown) => {
+        raw += Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk);
+        if (typeof encoding === "function") encoding();
+        if (typeof callback === "function") callback();
+        return true;
+    }) as typeof process.stdout.write;
+    Object.defineProperty(process.stdout, "columns", { value: 84, configurable: true });
+    Object.defineProperty(process.stdout, "rows", { value: 18, configurable: true });
+
+    const ui = await TerminalUi.create();
+    const prompt = ui.ask(">", { placeholder: "Type a message" }).catch(() => undefined);
+    try {
+        ui.setSessionDetails([
+            { left: "~/repos/new-projects/perry-new (main)" },
+            { left: "context [46%/400k]", right: "gpt-5.4 · high" },
+        ]);
+        await wait(5);
+        ui.cancelActiveInput();
+        await prompt;
+    } finally {
+        ui.cancelActiveInput();
+        ui.destroy();
+        (process.stdout as unknown as { write: typeof process.stdout.write }).write = originalWrite as typeof process.stdout.write;
+        if (columnsDescriptor) Object.defineProperty(process.stdout, "columns", columnsDescriptor);
+        else delete (process.stdout as unknown as { columns?: number }).columns;
+        if (rowsDescriptor) Object.defineProperty(process.stdout, "rows", rowsDescriptor);
+        else delete (process.stdout as unknown as { rows?: number }).rows;
+    }
+
+    const transcript = raw.replace(/\u001b\[[0-9;?]*[A-Za-z]/g, "").replace(/\r/g, "\n");
+    assert.match(transcript, /~\/repos\/new-projects\/perry-new \(main\)/);
+    const metadataLine = transcript.split("\n").find((line) => line.includes("context [46%/400k]"));
+    assert.ok(metadataLine, `prompt metadata line missing.\n${transcript}`);
+    assert.match(metadataLine!, /^context \[46%\/400k\]\s{3,}gpt-5\.4 · high$/);
 }
 
 async function assertThinkingStreamUsesRemainingLineWidthBeforeWrapping(): Promise<void> {
@@ -611,7 +1286,7 @@ async function assertFullSmokeFlowCompletes(): Promise<void> {
             "Words should wrap as whole words everywhere; only an extremely long single_token_without_any_spaces_should_be_allowed_to_split_when_it_exceeds_the_terminal_width.\n\n",
             "1. The prompt is only displayed while waiting for input.\n",
             "2. The loader represents the full model/tool/model lifecycle.\n",
-            "3. Tool traces are numbered and can be expanded later with `/trace <number>`.\n\n",
+            "3. Tool traces are summarized inline without a separate expansion command.\n\n",
             "> Formatting should work consistently in assistant output, thinking panels, and trace panels.\n\n",
             "| Area | Expected |\n| --- | --- |\n| titles | styled |\n| bullets | wrapped |\n| code | highlighted |\n\n",
             "- [x] inline `code`\n- [x] links like https://example.com\n\n",
@@ -633,6 +1308,12 @@ async function assertFullSmokeFlowCompletes(): Promise<void> {
     assert.match(transcript, /Worked for/);
 }
 
+test("resize replays retained history at new width", assertResizeReplaysRetainedHistoryAtNewWidth);
+test("resize event without size change does not replay history", assertResizeEventWithoutSizeChangeDoesNotReplayHistory);
+test("resize event with width change replays retained history", assertResizeEventWithWidthChangeReplaysRetainedHistory);
+test("refreshHistory redraw drops unretained streaming blocks", assertRefreshHistoryDropsUnretainedStreamingBlocks);
+test("startup ANSI preview is centered at native size", assertStartupAnsiPreviewIsCenteredAtNativeSize);
+
 test("streaming merge keeps common chunks", async () => {
     const ui = await TerminalUi.create();
     try {
@@ -642,17 +1323,36 @@ test("streaming merge keeps common chunks", async () => {
     }
 });
 
+test("prompt Shift+Tab cycles reasoning level", assertPromptShiftTabCyclesReasoningLevel);
+test("prompt up/down navigates message history", assertPromptUpDownNavigatesHistory);
+test("prompt up moves within wrapped draft before history", assertPromptUpMovesWithinWrappedDraftBeforeHistory);
+test("prompt bracketed paste preserves multiline text without submitting", assertPromptBracketedPastePreservesMultilineTextWithoutSubmitting);
 test("read trace uses pi-mono style card", assertReadTraceUsesPiMonoStyleCard);
 test("edit trace uses diff card without fence markers", assertEditTraceUsesDiffCardWithoutFenceMarkers);
 test("live edit trace hides huge arguments until diff is ready", assertEditTraceDoesNotRenderHugeArgumentsBeforeDiff);
 test("edit trace preserves all changed lines and caps only context", assertEditTracePreservesAllChangedLinesAndCapsContext);
 test("stale tool output does not append duplicate cards", assertStaleToolOutputDoesNotAppendDuplicateCards);
+test("running tool elapsed time updates live", assertRunningToolElapsedUpdatesLive);
 test("numbered list markers stay intact across streaming boundaries", assertNumberedListMarkerDoesNotSplitAcrossStreamingBoundary);
+test("inline markdown delimiters do not leak across streaming boundaries", assertInlineMarkdownDelimitersDoNotLeakAcrossStreamingBoundary);
+test("inline code delimiters do not leak across streaming boundaries", assertInlineCodeDelimitersDoNotLeakAcrossStreamingBoundary);
+test("plain chunks stream immediately", assertPlainChunksStreamImmediately);
 test("active prompt busy streams flush safely", assertActivePromptBusyStreamFlushesSafely);
+test("active prompt streaming restores input frame", assertActivePromptStreamingRestoresInputFrame);
+test("active prompt busy spinner does not redraw prompt every tick", assertActivePromptBusySpinnerDoesNotRedrawPromptEveryTick);
+test("active prompt busy timer advances while input active", assertActivePromptBusyTimerAdvancesWhileInputActive);
+test("active prompt slow streaming keeps session details visible", assertActivePromptSlowStreamingKeepsSessionDetailsVisible);
 test("cumulative snapshot deltas do not repeat prefixes", assertCumulativeSnapshotDeltasDoNotPrintRepeatedPrefixes);
 test("streaming growth does not replay prefixes into scrollback", assertStreamingGrowthDoesNotReplayPrefixesIntoScrollback);
 test("choice frames separate options clearly", assertChoiceFrameSeparatesOptionsClearly);
 test("choice frames keep metadata inline when width allows", assertChoiceFrameAlignsSessionMetadataOnTheRightWhenWidthAllows);
+test("choice frames style selected option turquoise and bold", assertChoiceFrameStylesSelectedOptionTurquoiseBold);
+test("choice frames style selected wrapped description turquoise and bold", assertChoiceFrameStylesSelectedWrappedDescriptionTurquoiseBold);
+test("choice frames use compact one-pixel padding approximation", assertChoiceFrameUsesCompactOnePixelApproximation);
+test("choice frames window long option lists with indicator", assertChoiceFrameWindowsLongOptionListsWithIndicator);
+test("bare slash shows windowed command suggestions with indicator", assertBareSlashShowsWindowedCommandSuggestionsWithIndicator);
+test("slash command suggestion window scrolls with selection", assertSlashCommandSuggestionWindowScrollsWithSelection);
+test("prompt renders repo and context metadata below the input box", assertPromptRendersRepoAndContextMetadataBelowInput);
 test("thinking streams keep using remaining line width before wrapping", assertThinkingStreamUsesRemainingLineWidthBeforeWrapping);
 test("clearing busy prints a worked duration line", assertClearBusyPrintsWorkedLine);
 test("busy overflow streams do not repeat or split content", assertBusyOverflowStreamDoesNotRepeatOrSplit);

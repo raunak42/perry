@@ -1,4 +1,5 @@
 import { emitKeypressEvents } from "node:readline";
+import { readFileSync } from "node:fs";
 import { filterSlashCommands, type SlashCommandDefinition } from "../helpers/commands";
 import type { KnownToolTraceDetails } from "../tools/traceDetails";
 import {
@@ -8,12 +9,21 @@ import {
 } from "./traceFormatting";
 import { BottomArea, type TransientFrame } from "./bottom-area";
 import { TerminalFormatter, type AnsiStyle } from "./terminal-formatting";
-import type { ChoiceOption, InteractiveUi, PromptOptions, SessionDetailLine } from "./types";
+import { openImageExternally } from "../helpers/externalImageViewer";
+import { renderTerminalImage } from "../helpers/inlineImage";
+import { formatClipboardPathForPrompt, pasteClipboardImageAsTempFile } from "../helpers/clipboardImage";
+import type { ChoiceOption, InteractiveUi, PersistableToolTrace, PromptOptions, SessionDetailLine, StartupCard } from "./types";
 
-const PROMPT_SUGGESTION_LIMIT = 5;
 const RESIZE_SETTLE_DELAY_MS = 120;
+const STREAM_INPUT_REDRAW_DEBOUNCE_MS = 80;
+const TOOL_ELAPSED_REDRAW_INTERVAL_MS = 100;
 const PROMPT_BORDER_CHARS = { horizontal: "─" };
 const CHOICE_HINT_TEXT = "↑/↓ move · Enter select · Ctrl+C cancel";
+const CHOICE_SELECTED_TEXT_STYLE: AnsiStyle = { fg: "#48d1cc", bold: true };
+const CHOICE_SELECTED_ROW_STYLE: AnsiStyle = { bg: "#1f1f1f" };
+const CHOICE_OPTION_HORIZONTAL_PADDING = 1;
+const CHOICE_OPTION_VERTICAL_PADDING_ROWS = 0;
+const CHOICE_MAX_VISIBLE_OPTIONS = 10;
 const READ_TRACE_PREVIEW_LINES = 20;
 const READ_TRACE_EXPANDED_LINES = 160;
 const WRITE_TRACE_PREVIEW_LINES = 20;
@@ -31,6 +41,11 @@ type Keypress = {
     ctrl?: boolean;
     meta?: boolean;
     shift?: boolean;
+};
+
+type TerminalSize = {
+    columns: number;
+    rows: number;
 };
 
 interface ToolHistorySnapshot {
@@ -65,14 +80,27 @@ interface StreamingBlockState {
     appendOnly: boolean;
 }
 
+type RetainedHistoryBlock =
+    | { kind: "markdown"; message: string }
+    | { kind: "warning"; message: string }
+    | { kind: "user"; message: string }
+    | { kind: "assistant"; message: string }
+    | { kind: "thinking"; message: string }
+    | { kind: "startup"; card: StartupCard }
+    | { kind: "worked"; elapsedMs: number }
+    | { kind: "tool"; key: string; trace: ToolHistorySnapshot };
+
 /**
- * Scrollback-first terminal UI.
+ * Scrollback-friendly terminal UI with retained committed blocks.
  *
- * Design rules:
- * - committed history is append-only;
- * - no viewport/history replay;
- * - only the current tail prompt, loader, streaming block, or trace may be rewritten;
- * - once a live tail is too tall to be safely rewritten, updates become append-only.
+ * The UI still writes to normal terminal scrollback during day-to-day use, but it
+ * keeps source data for committed blocks so explicit refreshes can rebuild the
+ * visible transcript when transient streaming output must be dropped.
+ *
+ * True terminal width changes replay retained history so committed transcript
+ * blocks reflow at the new size. No-op and height-only resize/focus events are
+ * ignored to avoid clearing/replaying scrollback when a terminal merely regains
+ * focus.
  */
 export class TerminalUi implements InteractiveUi {
     private readonly formatter = new TerminalFormatter(() => this.getTerminalWidth());
@@ -83,7 +111,7 @@ export class TerminalUi implements InteractiveUi {
         beginBlock: () => this.beginBlock(),
         canShowBusyLine: () => this.canSafelyShowBusyLine(),
         isInputActive: () => this.activeSessionCleanup !== null,
-        requestInputRedraw: () => this.activeSessionRedraw?.(),
+        requestInputRedraw: () => this.requestActiveSessionRedraw(),
         formatter: this.formatter,
     });
     private currentReasoningLevel = "high";
@@ -104,6 +132,17 @@ export class TerminalUi implements InteractiveUi {
     private activeSessionReject: ((error: Error) => void) | null = null;
     private activeSessionCleanup: (() => void) | null = null;
     private activeSessionRedraw: (() => void) | null = null;
+    private activeSessionRedrawTimer: ReturnType<typeof setTimeout> | null = null;
+    private toolElapsedTimer: ReturnType<typeof setInterval> | null = null;
+    private deferActiveSessionRedraws = false;
+    private stdoutBatchDepth = 0;
+    private stdoutBatchBuffer = "";
+    private readonly retainedHistory: RetainedHistoryBlock[] = [];
+    private readonly toolTraceFinishedListeners = new Set<(trace: PersistableToolTrace) => void>();
+    private replayingRetainedHistory = false;
+    private resizeRedrawTimer: ReturnType<typeof setTimeout> | null = null;
+    private resizeHandlerAttached = false;
+    private lastKnownTerminalSize: TerminalSize | null = this.readTerminalSize();
 
     static async create(): Promise<TerminalUi> {
         return new TerminalUi();
@@ -120,10 +159,15 @@ export class TerminalUi implements InteractiveUi {
             let cursor = 0;
             let selectedSuggestionIndex = 0;
             let frame: TransientFrame | null = null;
+            let historyIndex: number | null = null;
+            let draftBeforeHistory: string | null = null;
+            let clipboardImagePasteInFlight = false;
+            let bracketedPasteActive = false;
+            let bracketedPasteBuffer = "";
 
             const getSuggestions = (): SlashCommandDefinition[] => {
                 if (options?.enableSlashCommands === false) return [];
-                return filterSlashCommands(value).slice(0, PROMPT_SUGGESTION_LIMIT);
+                return filterSlashCommands(value);
             };
 
             const clampSuggestionIndex = () => {
@@ -131,6 +175,63 @@ export class TerminalUi implements InteractiveUi {
                 selectedSuggestionIndex = suggestions.length === 0
                     ? 0
                     : Math.max(0, Math.min(selectedSuggestionIndex, suggestions.length - 1));
+            };
+
+            const getHistoryEntries = (): string[] => {
+                const source = typeof options?.history === "function" ? options.history() : options?.history;
+                return (source ?? [])
+                    .map((entry) => this.normalizeNewlines(entry))
+                    .filter((entry) => entry.trim().length > 0);
+            };
+
+            const resetHistoryNavigation = () => {
+                historyIndex = null;
+                draftBeforeHistory = null;
+            };
+
+            const moveCursorVertically = (direction: -1 | 1): boolean => {
+                if (value.length === 0) return false;
+                const width = this.getTransientFrameWidth();
+                const layout = this.buildInputLayout(value, width, cursor);
+                const targetRow = layout.cursorRow + direction;
+                const maxRow = Math.max(0, this.buildInputLayout(value, width, value.length).lines.length - 1);
+                if (targetRow < 0 || targetRow > maxRow) return false;
+                cursor = this.findInputCursorAtVisualPosition(value, width, targetRow, layout.cursorCol);
+                redraw();
+                return true;
+            };
+
+            const navigateHistory = (direction: -1 | 1): boolean => {
+                const entries = getHistoryEntries();
+                if (entries.length === 0) return false;
+
+                if (direction < 0) {
+                    if (historyIndex === null) {
+                        draftBeforeHistory = value;
+                        historyIndex = entries.length - 1;
+                    } else {
+                        historyIndex = Math.max(0, historyIndex - 1);
+                    }
+                    value = entries[historyIndex] ?? "";
+                    cursor = value.length;
+                    selectedSuggestionIndex = 0;
+                    redraw();
+                    return true;
+                }
+
+                if (historyIndex === null) return false;
+                if (historyIndex < entries.length - 1) {
+                    historyIndex += 1;
+                    value = entries[historyIndex] ?? "";
+                } else {
+                    value = draftBeforeHistory ?? "";
+                    historyIndex = null;
+                    draftBeforeHistory = null;
+                }
+                cursor = value.length;
+                selectedSuggestionIndex = 0;
+                redraw();
+                return true;
             };
 
             const renderFrame = (): TransientFrame => {
@@ -147,6 +248,7 @@ export class TerminalUi implements InteractiveUi {
             };
 
             const redraw = () => {
+                this.detachStreamingCursorForTransient();
                 frame = this.bottomArea.renderTransient(frame, renderFrame());
             };
 
@@ -156,6 +258,8 @@ export class TerminalUi implements InteractiveUi {
                 this.activeSessionCleanup = null;
                 this.activeSessionReject = null;
                 this.activeSessionRedraw = null;
+                this.clearActiveSessionRedrawTimer();
+                this.deferActiveSessionRedraws = false;
                 teardown();
                 if (error) {
                     reject(error);
@@ -169,33 +273,95 @@ export class TerminalUi implements InteractiveUi {
                 cleanup(selected ? selected.name : value);
             };
 
+            const insertText = (textToInsert: string, options?: { redraw?: boolean }) => {
+                value = value.slice(0, cursor) + textToInsert + value.slice(cursor);
+                cursor += textToInsert.length;
+                selectedSuggestionIndex = 0;
+                resetHistoryNavigation();
+                if (options?.redraw !== false) redraw();
+            };
+
+            const insertPastedText = (textToInsert: string) => {
+                const normalized = this.normalizeNewlines(textToInsert.replace(/\r(?!\n)/g, "\n"));
+                if (normalized.length > 0) insertText(normalized);
+            };
+
+            const pasteClipboardImage = async () => {
+                if (clipboardImagePasteInFlight) return;
+                clipboardImagePasteInFlight = true;
+                try {
+                    const pasted = await pasteClipboardImageAsTempFile();
+                    if (!pasted) return;
+                    insertText(formatClipboardPathForPrompt(pasted.path));
+                } finally {
+                    clipboardImagePasteInFlight = false;
+                }
+            };
+
             const onKeypress = (text: string, key: Keypress) => {
+                if (key.name === "paste-start") {
+                    bracketedPasteActive = true;
+                    bracketedPasteBuffer = "";
+                    return;
+                }
+                if (key.name === "paste-end") {
+                    const pastedText = bracketedPasteBuffer;
+                    bracketedPasteActive = false;
+                    bracketedPasteBuffer = "";
+                    insertPastedText(pastedText);
+                    return;
+                }
+                if (bracketedPasteActive) {
+                    bracketedPasteBuffer += typeof text === "string" ? text : key.sequence ?? "";
+                    return;
+                }
                 if (key.ctrl && key.name === "c") {
                     const interruptError = new Error("Interrupted");
                     interruptError.name = "UserInterruptError";
                     cleanup(undefined, interruptError);
                     return;
                 }
+                if (key.ctrl && key.name === "v") {
+                    void pasteClipboardImage();
+                    return;
+                }
 
                 const suggestions = getSuggestions();
+                const isShiftTab = (key.name === "tab" && key.shift) || key.sequence === "\u001b[Z";
+                if (isShiftTab) {
+                    options?.onCycleReasoningLevel?.();
+                    redraw();
+                    return;
+                }
                 if (key.meta && key.name === "up") {
                     const queuedText = this.queuedMessageEditHandler?.() ?? "";
                     if (queuedText.trim().length > 0) {
                         value = queuedText;
                         cursor = value.length;
                         selectedSuggestionIndex = 0;
+                        resetHistoryNavigation();
                         redraw();
                     }
                     return;
                 }
-                if (key.name === "up" && suggestions.length > 0) {
-                    selectedSuggestionIndex = Math.max(0, selectedSuggestionIndex - 1);
-                    redraw();
+                if (key.name === "up") {
+                    if (suggestions.length > 0) {
+                        selectedSuggestionIndex = Math.max(0, selectedSuggestionIndex - 1);
+                        redraw();
+                        return;
+                    }
+                    if (moveCursorVertically(-1)) return;
+                    navigateHistory(-1);
                     return;
                 }
-                if (key.name === "down" && suggestions.length > 0) {
-                    selectedSuggestionIndex = Math.min(suggestions.length - 1, selectedSuggestionIndex + 1);
-                    redraw();
+                if (key.name === "down") {
+                    if (suggestions.length > 0) {
+                        selectedSuggestionIndex = Math.min(suggestions.length - 1, selectedSuggestionIndex + 1);
+                        redraw();
+                        return;
+                    }
+                    if (moveCursorVertically(1)) return;
+                    navigateHistory(1);
                     return;
                 }
                 if (key.name === "left") {
@@ -223,6 +389,7 @@ export class TerminalUi implements InteractiveUi {
                         value = value.slice(0, cursor - 1) + value.slice(cursor);
                         cursor -= 1;
                         selectedSuggestionIndex = 0;
+                        resetHistoryNavigation();
                         redraw();
                     }
                     return;
@@ -231,6 +398,7 @@ export class TerminalUi implements InteractiveUi {
                     if (cursor < value.length) {
                         value = value.slice(0, cursor) + value.slice(cursor + 1);
                         selectedSuggestionIndex = 0;
+                        resetHistoryNavigation();
                         redraw();
                     }
                     return;
@@ -241,6 +409,7 @@ export class TerminalUi implements InteractiveUi {
                         value = selected.name;
                         cursor = value.length;
                         selectedSuggestionIndex = 0;
+                        resetHistoryNavigation();
                         redraw();
                     }
                     return;
@@ -250,13 +419,7 @@ export class TerminalUi implements InteractiveUi {
                     return;
                 }
                 if (typeof text === "string" && text.length > 0 && !key.ctrl && !key.meta) {
-                    const sanitized = text.replace(/[\r\n]/g, "");
-                    if (sanitized.length > 0) {
-                        value = value.slice(0, cursor) + sanitized + value.slice(cursor);
-                        cursor += sanitized.length;
-                        selectedSuggestionIndex = 0;
-                        redraw();
-                    }
+                    insertText(text);
                 }
             };
 
@@ -285,6 +448,7 @@ export class TerminalUi implements InteractiveUi {
 
             const renderFrame = (): TransientFrame => this.buildChoiceFrame(prompt, options, selectedIndex);
             const redraw = () => {
+                this.detachStreamingCursorForTransient();
                 frame = this.bottomArea.renderTransient(frame, renderFrame());
             };
 
@@ -294,6 +458,8 @@ export class TerminalUi implements InteractiveUi {
                 this.activeSessionCleanup = null;
                 this.activeSessionReject = null;
                 this.activeSessionRedraw = null;
+                this.clearActiveSessionRedrawTimer();
+                this.deferActiveSessionRedraws = false;
                 teardown();
                 if (error) {
                     reject(error);
@@ -341,6 +507,7 @@ export class TerminalUi implements InteractiveUi {
         if (this.destroyed) return;
         const normalized = this.normalizeNewlines(message);
         if (normalized.trim().length === 0) return;
+        this.retainHistoryBlock({ kind: "markdown", message: normalized });
         this.liveTailTrace = null;
         this.printDuringBusy(() => this.printBlock(this.renderMarkdownBlock(normalized), false));
     }
@@ -349,6 +516,7 @@ export class TerminalUi implements InteractiveUi {
         if (this.destroyed) return;
         const normalized = this.normalizeNewlines(message);
         if (normalized.trim().length === 0) return;
+        this.retainHistoryBlock({ kind: "warning", message: normalized });
         this.liveTailTrace = null;
         this.printDuringBusy(() => this.printBlock(this.renderWarningBlock(normalized), false));
     }
@@ -357,16 +525,55 @@ export class TerminalUi implements InteractiveUi {
         if (this.destroyed) return;
         const normalized = this.normalizeNewlines(message);
         if (normalized.length === 0) return;
+        this.retainHistoryBlock({ kind: "user", message: normalized });
         this.liveTailTrace = null;
         this.printDuringBusy(() => this.printBlock(this.renderUserBlock(normalized), false));
+    }
+
+    writeAssistant(message: string): void {
+        if (this.destroyed) return;
+        const normalized = this.normalizeNewlines(message);
+        if (normalized.trim().length === 0) return;
+        const blockId = this.startStreamingBlock("", "default");
+        this.appendToStreamingBlock(blockId, normalized);
+        this.finishStreamingBlock(blockId);
     }
 
     writeThinking(message: string): void {
         if (this.destroyed) return;
         const normalized = this.normalizeNewlines(message);
         if (normalized.trim().length === 0) return;
+        this.retainHistoryBlock({ kind: "thinking", message: normalized });
         this.liveTailTrace = null;
         this.printDuringBusy(() => this.printBlock(this.renderThinkingBlock(normalized), false));
+    }
+
+    writeStartupCard(card: StartupCard): void {
+        if (this.destroyed) return;
+        this.retainHistoryBlock({ kind: "startup", card: this.cloneStartupCard(card) });
+        this.liveTailTrace = null;
+        const renderedImage = card.imagePath
+            ? renderTerminalImage(card.imagePath, {
+                widthCells: this.getStartupImageWidthCells(),
+                heightCells: this.getStartupImageHeightCells(),
+                widthPx: this.getStartupImageWidthPx(),
+                heightPx: this.getStartupImageHeightPx(),
+                name: card.imagePath.split(/[\\/]/).pop() ?? "perry-startup-image",
+            })
+            : null;
+        if (!renderedImage && card.imagePath) openImageExternally(card.imagePath);
+        const ansiPreview = !renderedImage ? this.readStartupAnsiPreview(card.ansiImagePath) : null;
+        const renderedText = this.renderStartupCardBlock(card, ansiPreview);
+
+        this.printDuringBusy(() => {
+            this.printBlock(renderedText, false);
+            if (renderedImage) {
+                this.beginBlock();
+                this.writeStdout(`${renderedImage.data}\n`);
+                this.finishBlock();
+                return;
+            }
+        });
     }
 
     startStreamingBlock(label = "", variant: MessageVariant = "default"): string {
@@ -410,6 +617,7 @@ export class TerminalUi implements InteractiveUi {
         const displayRawText = this.getStreamingDisplayText(block);
         const delta = this.getStreamingDelta(block.emittedText, displayRawText);
         if (!delta) return;
+        if (!block.started && this.hasUnstableInlineMarkdown(displayRawText)) return;
 
         const rendered = this.renderStreamingBlock(block, displayRawText);
         const renderedRows = this.measureRenderedRows(rendered);
@@ -480,29 +688,37 @@ export class TerminalUi implements InteractiveUi {
         });
     }
 
-    finishStreamingBlock(id: string): void {
+    finishStreamingBlock(id: string, options?: { retain?: boolean }): void {
         const block = this.streamingBlocks.get(id);
         if (!block) return;
         const hadBusyLine = this.bottomArea.isBusyVisible && !this.activeSessionCleanup && this.bottomArea.isBusyLineVisible;
-        this.bottomArea.withHiddenTransient(() => {
-            const hiddenBusyGapRows = hadBusyLine ? this.bottomArea.hideBusyLine() : 0;
-            if (block.rawText.startsWith(block.emittedText) && block.emittedText.length < block.rawText.length) {
-                block.rawAppendBuffer += block.rawText.slice(block.emittedText.length);
-                block.emittedText = block.rawText;
+        this.batchStdout(() => {
+            this.bottomArea.withHiddenTransient(() => {
+                const hiddenBusyGapRows = hadBusyLine ? this.bottomArea.hideBusyLine() : 0;
+                if (block.rawText.startsWith(block.emittedText) && block.emittedText.length < block.rawText.length) {
+                    block.rawAppendBuffer += block.rawText.slice(block.emittedText.length);
+                    block.emittedText = block.rawText;
+                }
+                if (block.rawAppendBuffer.length > 0) {
+                    this.flushRawAppendBuffer(block, true, hiddenBusyGapRows);
+                }
+                if (block.styleOpen) {
+                    this.writeStdout(this.resetAnsi());
+                    block.styleOpen = false;
+                }
+                if (block.started && !block.endedWithNewline) {
+                    this.writeStdout("\n");
+                }
+                if (block.started) this.finishBlock();
+            }, { restore: false });
+            if (options?.retain !== false) {
+                this.retainFinishedStreamingBlock(block);
             }
-            if (block.rawAppendBuffer.length > 0) {
-                this.flushRawAppendBuffer(block, true, hiddenBusyGapRows);
+            this.streamingBlocks.delete(id);
+            if (this.activeSessionCleanup && this.streamingBlocks.size === 0) {
+                this.requestActiveSessionRedraw({ immediate: true });
             }
-            if (block.styleOpen) {
-                this.writeStdout(this.resetAnsi());
-                block.styleOpen = false;
-            }
-            if (block.started && !block.endedWithNewline) {
-                this.writeStdout("\n");
-            }
-            if (block.started) this.finishBlock();
         });
-        this.streamingBlocks.delete(id);
         if (this.bottomArea.isBusyVisible && !this.activeSessionCleanup) {
             if (hadBusyLine) this.needsBlockSeparator = false;
             this.bottomArea.restoreBusyLine();
@@ -527,6 +743,7 @@ export class TerminalUi implements InteractiveUi {
         if (this.shouldDisplayToolTrace(trace, existing)) {
             this.commitToolTrace(trace);
         }
+        this.updateToolElapsedTimer();
     }
 
     showToolCallArguments(id: string, toolName: string, argsText: string, args?: unknown): void {
@@ -544,6 +761,7 @@ export class TerminalUi implements InteractiveUi {
         });
         this.storeToolTrace(trace);
         if (this.toolPrinted.has(id)) this.commitToolTrace(trace, { appendIfStale: false });
+        this.updateToolElapsedTimer();
     }
 
     updateToolCallArguments(id: string, argsText: string, args?: unknown): void {
@@ -552,6 +770,7 @@ export class TerminalUi implements InteractiveUi {
         const trace = { ...existing, args: args ?? existing.args, argsText: this.normalizeNewlines(argsText) };
         this.storeToolTrace(trace);
         if (this.toolPrinted.has(id)) this.commitToolTrace(trace, { appendIfStale: false });
+        this.updateToolElapsedTimer();
     }
 
     startToolExecution(id: string): void {
@@ -560,6 +779,7 @@ export class TerminalUi implements InteractiveUi {
         const trace = { ...existing, status: "running" as ToolTraceStatus, startedAt: existing.startedAt ?? Date.now() };
         this.storeToolTrace(trace);
         if (this.shouldDisplayToolTrace(trace, existing)) this.commitToolTrace(trace);
+        this.updateToolElapsedTimer();
     }
 
     updateToolExecution(id: string, output: string, isError = false, details?: unknown): void {
@@ -577,6 +797,7 @@ export class TerminalUi implements InteractiveUi {
 
         this.toolLastOutput.set(id, normalizedOutput);
         this.commitToolTrace(trace, { appendIfStale: false });
+        this.updateToolElapsedTimer();
     }
 
     finishToolExecution(id: string, output: string, isError = false, details?: unknown): void {
@@ -594,6 +815,32 @@ export class TerminalUi implements InteractiveUi {
         this.storeToolTrace(trace);
         this.toolLastOutput.set(id, normalizedOutput);
         this.commitToolTrace(trace, { appendIfStale: false });
+        this.notifyToolTraceFinished(trace);
+        this.updateToolElapsedTimer();
+    }
+
+    restoreToolTrace(trace: PersistableToolTrace): void {
+        if (this.destroyed) return;
+        if (this.toolTraces.has(trace.id)) return;
+        const restored = this.createToolTraceSnapshot(trace.id, trace.toolName, {
+            displayId: trace.displayId,
+            args: trace.args,
+            argsText: trace.argsText,
+            output: this.normalizeNewlines(trace.output ?? ""),
+            status: trace.status,
+            details: this.getKnownToolTraceDetails(trace.details),
+            expanded: trace.expanded ?? false,
+            startedAt: trace.startedAt,
+            finishedAt: trace.finishedAt,
+        });
+        this.storeToolTrace(restored);
+        this.commitToolTrace(restored, { appendIfStale: true });
+        this.updateToolElapsedTimer();
+    }
+
+    onToolTraceFinished(listener: (trace: PersistableToolTrace) => void): () => void {
+        this.toolTraceFinishedListeners.add(listener);
+        return () => this.toolTraceFinishedListeners.delete(listener);
     }
 
     expandTrace(reference: string): boolean {
@@ -606,11 +853,12 @@ export class TerminalUi implements InteractiveUi {
         const expanded = { ...trace, expanded: true };
         this.storeToolTrace(expanded);
         this.commitToolTrace(expanded, { forceNewBlock: true });
+        this.updateToolElapsedTimer();
         return true;
     }
 
     refreshHistory(): void {
-        // Intentional no-op. This UI is scrollback-first and append-only.
+        this.redrawRetainedHistoryForResize();
     }
 
     setStatus(message: string): void {
@@ -619,10 +867,12 @@ export class TerminalUi implements InteractiveUi {
 
     setReasoningLevel(level: string): void {
         this.currentReasoningLevel = level;
+        this.requestActiveSessionRedraw({ immediate: true });
     }
 
     setSessionDetails(lines: SessionDetailLine[]): void {
         this.sessionDetails = lines;
+        this.requestActiveSessionRedraw({ immediate: true });
     }
 
     setBusy(message = "Working"): void {
@@ -632,15 +882,15 @@ export class TerminalUi implements InteractiveUi {
 
     setQueuedSteeringMessages(messages: string[]): void {
         this.queuedSteeringMessages = messages.map((message) => this.normalizeNewlines(message).trim()).filter(Boolean);
-        this.activeSessionRedraw?.();
+        this.requestActiveSessionRedraw({ immediate: true });
     }
 
     setQueuedMessageEditHandler(handler: (() => string) | null): void {
         this.queuedMessageEditHandler = handler;
     }
 
-    clearBusy(): void {
-        this.clearBusyInternal({ showWorkedLine: true });
+    clearBusy(options?: { showWorkedLine?: boolean }): void {
+        this.clearBusyInternal({ showWorkedLine: options?.showWorkedLine !== false });
     }
 
     cancelActiveInput(): void {
@@ -659,6 +909,11 @@ export class TerminalUi implements InteractiveUi {
             this.activeSessionReject = null;
             reject(new Error("UI closed."));
         }
+        this.clearActiveSessionRedrawTimer();
+        this.clearResizeRedrawTimer();
+        this.detachResizeHandler();
+        this.stopToolElapsedTimer();
+        this.deferActiveSessionRedraws = false;
         if (this.activeSessionCleanup) {
             const cleanup = this.activeSessionCleanup;
             this.activeSessionCleanup = null;
@@ -696,6 +951,25 @@ export class TerminalUi implements InteractiveUi {
     private storeToolTrace(trace: ToolHistorySnapshot): void {
         this.toolTraces.set(trace.id, trace);
         this.toolTraceDisplayIds.set(trace.displayId, trace.id);
+        this.nextToolDisplayId = Math.max(this.nextToolDisplayId, trace.displayId + 1);
+    }
+
+    private notifyToolTraceFinished(trace: ToolHistorySnapshot): void {
+        if (this.toolTraceFinishedListeners.size === 0) return;
+        const snapshot: PersistableToolTrace = {
+            id: trace.id,
+            displayId: trace.displayId,
+            toolName: trace.toolName,
+            args: trace.args,
+            argsText: trace.argsText,
+            output: trace.output,
+            status: trace.status,
+            details: trace.details,
+            expanded: trace.expanded,
+            startedAt: trace.startedAt,
+            finishedAt: trace.finishedAt,
+        };
+        for (const listener of this.toolTraceFinishedListeners) listener(snapshot);
     }
 
     private shouldDisplayToolTrace(trace: ToolHistorySnapshot, existing?: ToolHistorySnapshot): boolean {
@@ -718,14 +992,16 @@ export class TerminalUi implements InteractiveUi {
         const appendIfStale = options?.appendIfStale === true;
         const busyGapRows = this.bottomArea.busyGapRows;
         const transientRows = this.bottomArea.activeTransientRows;
+        const availableRows = this.getTerminalHeight() - busyGapRows - transientRows;
         const canRewriteTail = !forceNewBlock
             && alreadyPrinted
             && this.liveTailTrace?.id === trace.id
-            && renderedRows <= this.liveTailTrace.rows
-            && this.liveTailTrace.rows + busyGapRows + transientRows < this.getTerminalHeight();
+            && this.liveTailTrace.rows < availableRows
+            && renderedRows < availableRows;
 
         if (canRewriteTail) {
             const rowsUp = (this.liveTailTrace?.rows ?? 0) + busyGapRows;
+            this.retainToolHistoryBlock(trace, { append: false });
             this.printDuringBusy(() => {
                 this.rewriteCurrentTailBlock(rendered, false, rowsUp);
                 this.liveTailTrace = { id: trace.id, rows: renderedRows, rendered };
@@ -735,6 +1011,7 @@ export class TerminalUi implements InteractiveUi {
         }
 
         if (!alreadyPrinted || forceNewBlock || appendIfStale) {
+            this.retainToolHistoryBlock(trace, { append: forceNewBlock || appendIfStale });
             this.printDuringBusy(() => {
                 this.printBlock(rendered, false);
                 this.liveTailTrace = { id: trace.id, rows: renderedRows, rendered };
@@ -746,6 +1023,36 @@ export class TerminalUi implements InteractiveUi {
         return false;
     }
 
+    private updateToolElapsedTimer(): void {
+        if ([...this.toolTraces.values()].some((trace) => trace.status === "running" && this.toolPrinted.has(trace.id))) {
+            this.startToolElapsedTimer();
+            return;
+        }
+        this.stopToolElapsedTimer();
+    }
+
+    private startToolElapsedTimer(): void {
+        if (this.toolElapsedTimer) return;
+        this.toolElapsedTimer = setInterval(() => this.refreshRunningToolElapsed(), TOOL_ELAPSED_REDRAW_INTERVAL_MS);
+        this.toolElapsedTimer.unref?.();
+    }
+
+    private stopToolElapsedTimer(): void {
+        if (!this.toolElapsedTimer) return;
+        clearInterval(this.toolElapsedTimer);
+        this.toolElapsedTimer = null;
+    }
+
+    private refreshRunningToolElapsed(): void {
+        if (this.destroyed) return;
+        const tailId = this.liveTailTrace?.id;
+        const trace = tailId ? this.toolTraces.get(tailId) : undefined;
+        if (trace?.status === "running" && this.toolPrinted.has(trace.id)) {
+            this.commitToolTrace(trace, { appendIfStale: false });
+        }
+        this.updateToolElapsedTimer();
+    }
+
     private clearBusyInternal(options: { showWorkedLine: boolean }): void {
         const elapsedMs = this.bottomArea.clearBusy();
         if (options.showWorkedLine && elapsedMs !== null) this.printWorkedLine(elapsedMs);
@@ -753,6 +1060,7 @@ export class TerminalUi implements InteractiveUi {
     }
 
     private printWorkedLine(elapsedMs: number): void {
+        this.retainHistoryBlock({ kind: "worked", elapsedMs });
         const rendered = this.renderWorkedLine(elapsedMs);
         this.printDuringBusy(() => this.printBlock(rendered, false));
     }
@@ -777,13 +1085,104 @@ export class TerminalUi implements InteractiveUi {
     }
 
     private printDuringBusy(operation: (hiddenBusyGapRows: number) => boolean | void): void {
-        this.bottomArea.withHiddenTransient(() => {
-            if (this.bottomArea.isBusyVisible && !this.activeSessionCleanup) {
-                this.bottomArea.withHiddenBusyLine(operation);
+        const hasActiveInput = this.activeSessionCleanup !== null;
+        const previousDeferInputRedraw = this.deferActiveSessionRedraws;
+        this.deferActiveSessionRedraws = hasActiveInput || previousDeferInputRedraw;
+        try {
+            this.batchStdout(() => {
+                this.bottomArea.withHiddenTransient(() => {
+                    if (this.bottomArea.isBusyVisible && !this.activeSessionCleanup) {
+                        this.bottomArea.withHiddenBusyLine(operation);
+                        return;
+                    }
+                    operation(0);
+                }, { restore: false });
+                if (hasActiveInput) this.requestActiveSessionRedraw({ immediate: true });
+            });
+        } finally {
+            this.deferActiveSessionRedraws = previousDeferInputRedraw;
+        }
+    }
+
+    private requestActiveSessionRedraw(options?: { immediate?: boolean; deferred?: boolean }): void {
+        if (!this.activeSessionRedraw) return;
+        const shouldDefer = options?.deferred === true || this.deferActiveSessionRedraws;
+        if (options?.immediate || !shouldDefer) {
+            this.clearActiveSessionRedrawTimer();
+            this.redrawActiveSession();
+            return;
+        }
+        if (this.activeSessionRedrawTimer) clearTimeout(this.activeSessionRedrawTimer);
+        this.activeSessionRedrawTimer = setTimeout(() => {
+            this.activeSessionRedrawTimer = null;
+            this.redrawActiveSession();
+        }, STREAM_INPUT_REDRAW_DEBOUNCE_MS);
+    }
+
+    private redrawActiveSession(): void {
+        this.activeSessionRedraw?.();
+    }
+
+    private detachStreamingCursorForTransient(): void {
+        const blocks = [...this.streamingBlocks.values()];
+        for (let index = blocks.length - 1; index >= 0; index -= 1) {
+            const block = blocks[index];
+            if (!block || !block.started || block.endedWithNewline || block.appendColumn <= 0) continue;
+            this.writeStdout("\n");
+            block.cursorDetachedAfterRewrite = true;
+            block.endedWithNewline = true;
+            return;
+        }
+    }
+
+    private clearActiveSessionRedrawTimer(): void {
+        if (!this.activeSessionRedrawTimer) return;
+        clearTimeout(this.activeSessionRedrawTimer);
+        this.activeSessionRedrawTimer = null;
+    }
+
+    private scheduleResizeRedraw(): void {
+        if (this.destroyed) return;
+        const currentSize = this.readTerminalSize();
+        if (!currentSize || this.isSameTerminalSize(currentSize, this.lastKnownTerminalSize)) return;
+        if (this.resizeRedrawTimer) clearTimeout(this.resizeRedrawTimer);
+        this.resizeRedrawTimer = setTimeout(() => {
+            this.resizeRedrawTimer = null;
+            const previousSize = this.lastKnownTerminalSize;
+            const settledSize = this.readTerminalSize();
+            if (!settledSize || this.isSameTerminalSize(settledSize, previousSize)) return;
+            const widthChanged = !previousSize || settledSize.columns !== previousSize.columns;
+            this.lastKnownTerminalSize = settledSize;
+            if (widthChanged) {
+                this.redrawRetainedHistoryForResize({ knownSize: settledSize });
                 return;
             }
-            operation(0);
-        });
+            this.refreshLiveTailAfterTerminalResize();
+        }, RESIZE_SETTLE_DELAY_MS);
+    }
+
+    private refreshLiveTailAfterTerminalResize(): void {
+        if (this.liveTailTrace) {
+            this.liveTailTrace = {
+                ...this.liveTailTrace,
+                rows: this.measureRenderedRows(this.liveTailTrace.rendered),
+            };
+        }
+        if (this.activeSessionCleanup) {
+            this.requestActiveSessionRedraw({ immediate: true });
+            return;
+        }
+        if (this.bottomArea.isBusyVisible) {
+            this.bottomArea.restoreBusyLine();
+            return;
+        }
+        this.writeStdout("\u001b[?25h");
+    }
+
+    private clearResizeRedrawTimer(): void {
+        if (!this.resizeRedrawTimer) return;
+        clearTimeout(this.resizeRedrawTimer);
+        this.resizeRedrawTimer = null;
     }
 
     private printBlock(text: string, indent: boolean): void {
@@ -808,6 +1207,159 @@ export class TerminalUi implements InteractiveUi {
         this.writeStdout("\r\u001b[J");
         this.writeStdout(`${this.layoutPrintedBlockLines(text, indent).join("\n")}\n`);
         this.needsBlockSeparator = true;
+    }
+
+    private retainHistoryBlock(block: RetainedHistoryBlock): void {
+        if (this.replayingRetainedHistory) return;
+        this.retainedHistory.push(this.cloneRetainedHistoryBlock(block));
+    }
+
+    private retainFinishedStreamingBlock(block: StreamingBlockState): void {
+        if (this.replayingRetainedHistory) return;
+        const text = this.normalizeNewlines(block.rawText);
+        if (text.trim().length === 0) return;
+        this.retainHistoryBlock({
+            kind: block.variant === "thinking" ? "thinking" : "assistant",
+            message: text,
+        });
+    }
+
+    private retainToolHistoryBlock(trace: ToolHistorySnapshot, options: { append: boolean }): void {
+        if (this.replayingRetainedHistory) return;
+        const key = `tool:${trace.id}`;
+        const block: RetainedHistoryBlock = {
+            kind: "tool",
+            key,
+            trace: this.cloneToolTrace(trace),
+        };
+        if (options.append) {
+            this.retainedHistory.push(block);
+            return;
+        }
+        for (let index = this.retainedHistory.length - 1; index >= 0; index -= 1) {
+            const existing = this.retainedHistory[index];
+            if (existing?.kind === "tool" && existing.key === key) {
+                this.retainedHistory[index] = block;
+                return;
+            }
+        }
+        this.retainedHistory.push(block);
+    }
+
+    private redrawRetainedHistoryForResize(options?: { knownSize?: TerminalSize }): void {
+        if (this.destroyed || this.replayingRetainedHistory) return;
+        const currentSize = options?.knownSize ?? this.readTerminalSize();
+        if (currentSize) this.lastKnownTerminalSize = currentSize;
+        this.batchStdout(() => {
+            this.replayingRetainedHistory = true;
+            try {
+                this.writeStdout("\u001b[?25l\u001b[H\u001b[2J\u001b[3J");
+                this.needsBlockSeparator = false;
+                this.liveTailTrace = null;
+                this.bottomArea.forgetRenderedState();
+                for (const block of this.retainedHistory) this.replayRetainedHistoryBlock(block);
+                this.replayLiveStreamingBlocksAfterResize();
+            } finally {
+                this.replayingRetainedHistory = false;
+            }
+            if (this.activeSessionCleanup) this.requestActiveSessionRedraw({ immediate: true });
+            else if (this.bottomArea.isBusyVisible) this.bottomArea.restoreBusyLine();
+            else this.writeStdout("\u001b[?25h");
+        });
+    }
+
+    private replayRetainedHistoryBlock(block: RetainedHistoryBlock): void {
+        switch (block.kind) {
+            case "markdown":
+                this.printBlock(this.renderMarkdownBlock(block.message), false);
+                return;
+            case "warning":
+                this.printBlock(this.renderWarningBlock(block.message), false);
+                return;
+            case "user":
+                this.printBlock(this.renderUserBlock(block.message), false);
+                return;
+            case "assistant":
+                this.printBlock(this.renderMarkdownBlock(block.message), false);
+                return;
+            case "thinking":
+                this.printBlock(this.renderThinkingBlock(block.message), false);
+                return;
+            case "startup": {
+                const renderedImage = block.card.imagePath
+                    ? renderTerminalImage(block.card.imagePath, {
+                        widthCells: this.getStartupImageWidthCells(),
+                        heightCells: this.getStartupImageHeightCells(),
+                        widthPx: this.getStartupImageWidthPx(),
+                        heightPx: this.getStartupImageHeightPx(),
+                        name: block.card.imagePath.split(/[\\/]/).pop() ?? "perry-startup-image",
+                    })
+                    : null;
+                const ansiPreview = !renderedImage ? this.readStartupAnsiPreview(block.card.ansiImagePath) : null;
+                this.printBlock(this.renderStartupCardBlock(block.card, ansiPreview), false);
+                if (renderedImage) {
+                    this.beginBlock();
+                    this.writeStdout(`${renderedImage.data}\n`);
+                    this.finishBlock();
+                }
+                return;
+            }
+            case "worked":
+                this.printBlock(this.renderWorkedLine(block.elapsedMs), false);
+                return;
+            case "tool": {
+                const rendered = this.renderToolTrace(block.trace);
+                this.printBlock(rendered, false);
+                this.liveTailTrace = {
+                    id: block.trace.id,
+                    rows: this.measureRenderedRows(rendered),
+                    rendered,
+                };
+                this.toolPrinted.add(block.trace.id);
+                return;
+            }
+        }
+    }
+
+    private replayLiveStreamingBlocksAfterResize(): void {
+        for (const block of this.streamingBlocks.values()) {
+            const displayText = this.getStreamingDisplayText(block);
+            if (displayText.trim().length === 0) continue;
+            const rendered = this.renderStreamingBlock(block, displayText);
+            const rows = this.measureRenderedRows(rendered);
+            this.printBlock(rendered, false);
+            block.started = true;
+            block.endedWithNewline = true;
+            block.printedRows = rows;
+            block.renderedText = rendered;
+            block.emittedText = displayText;
+            block.appendColumn = this.getRenderedTailColumn(rendered);
+            block.appendPendingSpace = /[ \t]$/.test(displayText);
+            block.rawAppendBuffer = "";
+            block.cursorDetachedAfterRewrite = block.appendColumn > 0;
+            block.printedRawEndsWithNewline = displayText.endsWith("\n");
+            block.appendOnly = true;
+        }
+    }
+
+    private cloneRetainedHistoryBlock(block: RetainedHistoryBlock): RetainedHistoryBlock {
+        if (block.kind === "startup") return { kind: "startup", card: this.cloneStartupCard(block.card) };
+        if (block.kind === "tool") return { kind: "tool", key: block.key, trace: this.cloneToolTrace(block.trace) };
+        return { ...block };
+    }
+
+    private cloneStartupCard(card: StartupCard): StartupCard {
+        return {
+            ...card,
+            lines: card.lines.map((line) => ({ ...line })),
+        };
+    }
+
+    private cloneToolTrace(trace: ToolHistorySnapshot): ToolHistorySnapshot {
+        return {
+            ...trace,
+            details: trace.details ? { ...trace.details } : undefined,
+        };
     }
 
     private writeStreamingRawDelta(block: StreamingBlockState, delta: string, hiddenBusyGapRows = 0): boolean {
@@ -854,9 +1406,20 @@ export class TerminalUi implements InteractiveUi {
             const boundary = this.findStableMarkdownBoundary(block.rawAppendBuffer);
             if (boundary < 0) break;
             const chunk = block.rawAppendBuffer.slice(0, boundary);
+            if (this.hasUnstableInlineMarkdown(chunk)) break;
             block.rawAppendBuffer = block.rawAppendBuffer.slice(boundary);
             wroteToTerminal = this.writeRenderedMarkdownChunk(block, chunk, true, pendingHiddenBusyGapRows) || wroteToTerminal;
             pendingHiddenBusyGapRows = 0;
+        }
+
+        if (!force && block.rawAppendBuffer.length > 0) {
+            const boundary = this.findImmediateStreamingBoundary(block.rawAppendBuffer);
+            if (boundary > 0) {
+                const chunk = block.rawAppendBuffer.slice(0, boundary);
+                block.rawAppendBuffer = block.rawAppendBuffer.slice(boundary);
+                wroteToTerminal = this.writeRenderedMarkdownChunk(block, chunk, false, pendingHiddenBusyGapRows) || wroteToTerminal;
+                pendingHiddenBusyGapRows = 0;
+            }
         }
 
         if (force && block.rawAppendBuffer.length > 0) {
@@ -880,6 +1443,107 @@ export class TerminalUi implements InteractiveUi {
         return -1;
     }
 
+    private findImmediateStreamingBoundary(text: string): number {
+        if (text.length === 0) return -1;
+        if (text.startsWith("\n")) {
+            const firstNonNewline = text.search(/[^\n]/);
+            return firstNonNewline < 0 ? text.length : firstNonNewline;
+        }
+        const lineEnd = text.indexOf("\n");
+        const candidate = lineEnd >= 0 ? text.slice(0, lineEnd) : text;
+        const trailingWhitespaceLength = candidate.match(/[ \t]+$/)?.[0].length ?? 0;
+        const boundary = candidate.length - trailingWhitespaceLength;
+        if (boundary <= 0) return -1;
+        return this.hasUnstableInlineMarkdown(text.slice(0, boundary)) ? -1 : boundary;
+    }
+
+    private hasUnstableInlineMarkdown(text: string): boolean {
+        let inlineCodeFence: string | null = null;
+        let strong = false;
+        let emphasis = false;
+        let strike = false;
+        let highlight = false;
+        let unmatchedLinkOpen = false;
+        let pendingLinkDestination = false;
+
+        for (let index = 0; index < text.length;) {
+            const char = text[index] ?? "";
+            if (char === "\\") {
+                index += 2;
+                continue;
+            }
+
+            if (char === "`") {
+                const tickRun = text.slice(index).match(/^`+/)?.[0] ?? "`";
+                if (inlineCodeFence === tickRun) inlineCodeFence = null;
+                else if (!inlineCodeFence) inlineCodeFence = tickRun;
+                index += tickRun.length;
+                continue;
+            }
+            if (inlineCodeFence) {
+                index += 1;
+                continue;
+            }
+
+            if (char === "[") {
+                unmatchedLinkOpen = true;
+                index += 1;
+                continue;
+            }
+            if (char === "]" && unmatchedLinkOpen) {
+                unmatchedLinkOpen = false;
+                if (text[index + 1] === "(") {
+                    pendingLinkDestination = true;
+                    index += 2;
+                    continue;
+                }
+                index += 1;
+                continue;
+            }
+            if (char === ")" && pendingLinkDestination) {
+                pendingLinkDestination = false;
+                index += 1;
+                continue;
+            }
+
+            if (text.startsWith("~~", index)) {
+                strike = !strike;
+                index += 2;
+                continue;
+            }
+            if (text.startsWith("==", index)) {
+                highlight = !highlight;
+                index += 2;
+                continue;
+            }
+            if (text.startsWith("***", index)) {
+                strong = !strong;
+                emphasis = !emphasis;
+                index += 3;
+                continue;
+            }
+            if (text.startsWith("**", index)) {
+                strong = !strong;
+                index += 2;
+                continue;
+            }
+            if (char === "*" && text[index - 1] !== "*" && text[index + 1] !== "*" && /\S/.test(text[index + 1] ?? "")) {
+                emphasis = !emphasis;
+                index += 1;
+                continue;
+            }
+            if (char === "_" && text[index - 1] !== "_" && text[index + 1] !== "_" && /\S/.test(text[index + 1] ?? "") && !/[A-Za-z0-9_]/.test(text[index - 1] ?? "")) {
+                emphasis = !emphasis;
+                index += 1;
+                continue;
+            }
+
+            index += 1;
+        }
+
+        return inlineCodeFence !== null || strong || emphasis || strike || highlight || unmatchedLinkOpen || pendingLinkDestination;
+    }
+
     private writeRenderedMarkdownChunk(block: StreamingBlockState, rawChunk: string, preserveBoundarySpacing: boolean, hiddenBusyGapRows = 0): boolean {
         if (rawChunk.length === 0) return false;
         if (hiddenBusyGapRows > 0) this.moveCursorUp(hiddenBusyGapRows);
@@ -888,8 +1552,8 @@ export class TerminalUi implements InteractiveUi {
         const shouldReattach = !startsNewMarkdownBlock
             && !rawChunk.startsWith("\n")
             && block.appendColumn > 0
-            && (block.cursorDetachedAfterRewrite || !block.printedRawEndsWithNewline);
-        const leadingContinuationSpace = shouldReattach && /^[ \t]/.test(rawChunk);
+            && block.cursorDetachedAfterRewrite;
+        const leadingContinuationSpace = !startsNewMarkdownBlock && block.appendColumn > 0 && /^[ \t]/.test(rawChunk);
         if (shouldReattach) this.reattachStreamingCursorIfNeeded(block);
         else if (block.appendColumn > 0 && startsNewMarkdownBlock) {
             this.writeStdout("\n");
@@ -979,27 +1643,19 @@ export class TerminalUi implements InteractiveUi {
     private beginInputSession(onKeypress: (text: string, key: Keypress) => void, onCleanup: () => void): () => void {
         emitKeypressEvents(process.stdin);
         const stdin = process.stdin;
-        const stdout = process.stdout;
         const wasRaw = stdin.isTTY ? !!stdin.isRaw : false;
         const wasPaused = typeof stdin.isPaused === "function" ? stdin.isPaused() : false;
         if (stdin.isTTY) stdin.setRawMode(true);
         stdin.resume();
+        this.attachResizeHandler();
+        const currentSize = this.readTerminalSize();
+        if (currentSize) this.lastKnownTerminalSize = currentSize;
         const handler = (text: string, key: Keypress) => onKeypress(text, key);
-        let resizeTimer: ReturnType<typeof setTimeout> | null = null;
-        const resizeHandler = () => {
-            if (resizeTimer) clearTimeout(resizeTimer);
-            resizeTimer = setTimeout(() => {
-                resizeTimer = null;
-                this.activeSessionRedraw?.();
-            }, RESIZE_SETTLE_DELAY_MS);
-        };
         stdin.on("keypress", handler);
-        if (stdout.isTTY) stdout.on("resize", resizeHandler);
-        this.writeStdout("\u001b[?25h");
+        this.writeStdout("\u001b[?2004h\u001b[?25h");
         return () => {
             stdin.off("keypress", handler);
-            if (stdout.isTTY) stdout.off("resize", resizeHandler);
-            if (resizeTimer) clearTimeout(resizeTimer);
+            this.writeStdout("\u001b[?2004l");
             if (stdin.isTTY) stdin.setRawMode(wasRaw);
             if (wasPaused) stdin.pause();
             this.writeStdout("\u001b[?25h");
@@ -1024,6 +1680,7 @@ export class TerminalUi implements InteractiveUi {
             lines.push("");
         }
         const busyStatus = this.bottomArea.getBusyStatusText();
+        const busyStatusRow = busyStatus ? lines.length : undefined;
         if (busyStatus) {
             lines.push(this.styleAnsi(this.fitToWidth(busyStatus, width), { fg: "#a3a3a3", dim: true }));
             lines.push("");
@@ -1039,20 +1696,32 @@ export class TerminalUi implements InteractiveUi {
             for (const line of inputLayout.lines) lines.push(line.padEnd(width, " "));
         }
         lines.push(this.styleAnsi(PROMPT_BORDER_CHARS.horizontal.repeat(width), { fg: borderColor }));
-        for (let index = 0; index < params.suggestions.length; index += 1) {
-            const suggestion = params.suggestions[index]!;
-            const raw = `${suggestion.name} — ${suggestion.description}`;
-            for (const suggestionLine of this.wrapPlainTextWords(raw, width)) {
-                lines.push(index === params.selectedSuggestionIndex
-                    ? this.styleAnsi(this.fitToWidth(suggestionLine, width), { fg: "#ffffff", bg: "#1f1f1f" })
-                    : this.styleAnsi(suggestionLine, { fg: "#d4d4d4" }));
+        const sessionDetailLines = this.renderSessionDetailLines(width);
+        if (sessionDetailLines.length > 0) {
+            lines.push(...sessionDetailLines);
+            if (params.suggestions.length > 0) {
+                lines.push("");
             }
+        }
+        const visibleSuggestions = this.getVisibleChoiceWindow(params.suggestions, params.selectedSuggestionIndex);
+        for (let visibleIndex = visibleSuggestions.start; visibleIndex < visibleSuggestions.end; visibleIndex += 1) {
+            const suggestion = params.suggestions[visibleIndex]!;
+            lines.push(...this.renderChoiceOptionLines({
+                label: suggestion.name,
+                value: suggestion.name,
+                description: suggestion.description,
+            }, visibleIndex === params.selectedSuggestionIndex, width));
+        }
+        if (params.suggestions.length > CHOICE_MAX_VISIBLE_OPTIONS) {
+            lines.push(this.renderChoicePositionIndicator(params.selectedSuggestionIndex, params.suggestions.length, width));
         }
         return {
             lines: this.needsBlockSeparator ? ["", ...lines] : lines,
             cursorRow: (this.needsBlockSeparator ? 1 : 0) + queuedLines.length + (queuedLines.length > 0 ? 1 : 0) + (busyStatus ? 2 : 0) + promptLines.length + 1 + inputLayout.cursorRow,
             cursorCol: inputLayout.cursorCol,
             cursorVisible: true,
+            width,
+            busyStatusRow: busyStatusRow === undefined ? undefined : busyStatusRow + (this.needsBlockSeparator ? 1 : 0),
         };
     }
 
@@ -1070,33 +1739,98 @@ export class TerminalUi implements InteractiveUi {
         return lines;
     }
 
+    private renderSessionDetailLines(width: number): string[] {
+        if (this.sessionDetails.length === 0) return [];
+
+        const rendered: string[] = [];
+        const style: AnsiStyle = { fg: "#7b8088", dim: true };
+
+        for (const detail of this.sessionDetails) {
+            const left = detail.left.trim();
+            const right = detail.right?.trim() ?? "";
+
+            if (!left && !right) {
+                continue;
+            }
+
+            if (!right) {
+                for (const line of this.wrapPlainTextWords(left, width)) {
+                    rendered.push(this.styleAnsi(line, style));
+                }
+                continue;
+            }
+
+            const leftWidth = this.getVisibleTextWidth(left);
+            const rightWidth = this.getVisibleTextWidth(right);
+            const gapWidth = width - leftWidth - rightWidth;
+
+            if (leftWidth > 0 && rightWidth > 0 && gapWidth >= 3) {
+                rendered.push(this.styleAnsi(`${left}${" ".repeat(gapWidth)}${right}`, style));
+                continue;
+            }
+
+            for (const line of this.wrapPlainTextWords(left, width)) {
+                rendered.push(this.styleAnsi(line, style));
+            }
+
+            if (rightWidth <= width) {
+                rendered.push(this.styleAnsi(`${" ".repeat(Math.max(0, width - rightWidth))}${right}`, style));
+            } else {
+                for (const line of this.wrapPlainTextWords(right, width)) {
+                    rendered.push(this.styleAnsi(line, style));
+                }
+            }
+        }
+
+        return rendered;
+    }
+
     private buildChoiceFrame<T>(prompt: string, options: ChoiceOption<T>[], selectedIndex: number): TransientFrame {
         const width = this.getTransientFrameWidth();
         const lines: string[] = [];
         lines.push(...this.wrapPlainTextWords(prompt, width).map((line) => this.styleAnsi(line, { fg: "#d4d4d4" })));
         lines.push(this.styleAnsi(CHOICE_HINT_TEXT, { fg: "#7b8088", dim: true }));
         lines.push("");
-        for (let index = 0; index < options.length; index += 1) {
-            const option = options[index]!;
-            lines.push(...this.renderChoiceOptionLines(option, index === selectedIndex, width));
+        const visibleOptions = this.getVisibleChoiceWindow(options, selectedIndex);
+        for (let visibleIndex = visibleOptions.start; visibleIndex < visibleOptions.end; visibleIndex += 1) {
+            const option = options[visibleIndex]!;
+            lines.push(...this.renderChoiceOptionLines(option, visibleIndex === selectedIndex, width));
+        }
+        if (options.length > CHOICE_MAX_VISIBLE_OPTIONS) {
+            lines.push(this.renderChoicePositionIndicator(selectedIndex, options.length, width));
         }
         return {
             lines: this.needsBlockSeparator ? ["", ...lines] : lines,
             cursorRow: (this.needsBlockSeparator ? 1 : 0) + Math.max(0, lines.length - 1),
             cursorCol: 0,
             cursorVisible: false,
+            width,
         };
     }
 
+    private getVisibleChoiceWindow<T>(options: readonly T[], selectedIndex: number): { start: number; end: number } {
+        if (options.length <= CHOICE_MAX_VISIBLE_OPTIONS) return { start: 0, end: options.length };
+        const maxStart = Math.max(0, options.length - CHOICE_MAX_VISIBLE_OPTIONS);
+        const halfWindow = Math.floor(CHOICE_MAX_VISIBLE_OPTIONS / 2);
+        const start = Math.min(maxStart, Math.max(0, selectedIndex - halfWindow));
+        return { start, end: Math.min(options.length, start + CHOICE_MAX_VISIBLE_OPTIONS) };
+    }
+
+    private renderChoicePositionIndicator(selectedIndex: number, total: number, width: number): string {
+        const label = `(${Math.min(total, Math.max(0, selectedIndex) + 1)}/${total})`;
+        return this.styleAnsi(this.fitToWidth(label, width), { fg: "#8aa9c8", dim: true });
+    }
+
     private renderChoiceOptionLines<T>(option: ChoiceOption<T>, selected: boolean, width: number): string[] {
+        const horizontalPadding = Math.min(CHOICE_OPTION_HORIZONTAL_PADDING, Math.max(0, Math.floor((width - 1) / 2)));
+        const innerWidth = Math.max(1, width - horizontalPadding * 2);
         const marker = selected ? "›" : " ";
         const firstPrefix = `${marker} `;
         const continuationPrefix = "  ";
         const descriptionPrefix = "    ";
-        const firstWidth = Math.max(1, width - this.getVisibleTextWidth(firstPrefix));
-        const continuationWidth = Math.max(1, width - this.getVisibleTextWidth(continuationPrefix));
-        const descriptionWidth = Math.max(1, width - this.getVisibleTextWidth(descriptionPrefix));
-        const lines: string[] = [];
+        const firstWidth = Math.max(1, innerWidth - this.getVisibleTextWidth(firstPrefix));
+        const descriptionWidth = Math.max(1, innerWidth - this.getVisibleTextWidth(descriptionPrefix));
+        const contentLines: string[] = [];
         const description = option.description?.trim();
 
         const canRenderInlineDescription = (() => {
@@ -1117,18 +1851,18 @@ export class TerminalUi implements InteractiveUi {
             const firstLabelLine = labelLines[0] ?? "";
             const paddedLabel = this.getVisibleTextWidth(firstLabelLine) >= labelWidth ? firstLabelLine : `${firstLabelLine}${" ".repeat(labelWidth - this.getVisibleTextWidth(firstLabelLine))}`;
             const firstLine = `${firstPrefix}${paddedLabel}${" ".repeat(inlineGap)}${description}`;
-            lines.push(selected
-                ? this.styleAnsi(this.fitToWidth(firstLine, width), { fg: "#ffffff", bg: "#1f1f1f" })
+            contentLines.push(selected
+                ? this.styleAnsi(firstLine, CHOICE_SELECTED_TEXT_STYLE)
                 : `${this.styleAnsi(`${firstPrefix}${paddedLabel}${" ".repeat(inlineGap)}`, { fg: "#d4d4d4" })}${this.styleAnsi(description, { fg: "#8f969d", dim: true })}`);
 
             for (const labelLine of labelLines.slice(1)) {
                 const text = `${continuationPrefix}${labelLine}`;
-                lines.push(selected
-                    ? this.styleAnsi(this.fitToWidth(text, width), { fg: "#ffffff", bg: "#1f1f1f" })
+                contentLines.push(selected
+                    ? this.styleAnsi(text, CHOICE_SELECTED_TEXT_STYLE)
                     : this.styleAnsi(text, { fg: "#d4d4d4" }));
             }
 
-            return lines;
+            return this.renderChoiceOptionComponent(contentLines, selected, width, horizontalPadding);
         }
 
         const labelLines = this.wrapPlainTextWords(option.label, firstWidth);
@@ -1136,8 +1870,8 @@ export class TerminalUi implements InteractiveUi {
             const prefix = index === 0 ? firstPrefix : continuationPrefix;
             const content = index === 0 ? labelLines[0] ?? "" : labelLines[index] ?? "";
             const text = `${prefix}${content}`;
-            lines.push(selected
-                ? this.styleAnsi(this.fitToWidth(text, width), { fg: "#ffffff", bg: "#1f1f1f" })
+            contentLines.push(selected
+                ? this.styleAnsi(text, CHOICE_SELECTED_TEXT_STYLE)
                 : this.styleAnsi(text, { fg: "#d4d4d4" }));
         }
 
@@ -1145,13 +1879,37 @@ export class TerminalUi implements InteractiveUi {
             const descriptionLines = this.wrapPlainTextWords(description, descriptionWidth);
             for (const descriptionLine of descriptionLines) {
                 const text = `${descriptionPrefix}${descriptionLine}`;
-                lines.push(selected
-                    ? this.styleAnsi(this.fitToWidth(text, width), { fg: "#b9c0c8", bg: "#1f1f1f", dim: true })
+                contentLines.push(selected
+                    ? this.styleAnsi(text, CHOICE_SELECTED_TEXT_STYLE)
                     : this.styleAnsi(text, { fg: "#8f969d", dim: true }));
             }
         }
 
+        return this.renderChoiceOptionComponent(contentLines, selected, width, horizontalPadding);
+    }
+
+    private renderChoiceOptionComponent(contentLines: string[], selected: boolean, width: number, horizontalPadding: number): string[] {
+        const lines: string[] = [];
+        const paddingLine = selected ? this.styleAnsi(" ".repeat(width), CHOICE_SELECTED_ROW_STYLE) : "";
+        for (let index = 0; index < CHOICE_OPTION_VERTICAL_PADDING_ROWS; index += 1) {
+            lines.push(paddingLine);
+        }
+        for (const contentLine of contentLines.length > 0 ? contentLines : [""]) {
+            const indented = `${" ".repeat(horizontalPadding)}${contentLine}`;
+            lines.push(selected
+                ? this.renderSelectedChoiceLine(indented, width)
+                : indented);
+        }
+        for (let index = 0; index < CHOICE_OPTION_VERTICAL_PADDING_ROWS; index += 1) {
+            lines.push(paddingLine);
+        }
         return lines;
+    }
+
+    private renderSelectedChoiceLine(content: string, width: number): string {
+        const visible = this.getVisibleTextWidth(content);
+        const padded = visible >= width ? content : `${content}${" ".repeat(width - visible)}`;
+        return this.styleAnsi(padded, CHOICE_SELECTED_ROW_STYLE);
     }
 
     private buildInputLayout(value: string, width: number, cursor: number): { lines: string[]; cursorRow: number; cursorCol: number } {
@@ -1161,6 +1919,23 @@ export class TerminalUi implements InteractiveUi {
         const cursorRow = Math.max(0, beforeCursor.length - 1);
         const cursorCol = this.getVisibleTextWidth(beforeCursor[cursorRow] ?? "");
         return { lines, cursorRow, cursorCol };
+    }
+
+    private findInputCursorAtVisualPosition(value: string, width: number, targetRow: number, targetCol: number): number {
+        let bestCursor = 0;
+        let bestDistance = Number.POSITIVE_INFINITY;
+
+        for (let candidate = 0; candidate <= value.length; candidate += 1) {
+            const layout = this.buildInputLayout(value, width, candidate);
+            if (layout.cursorRow !== targetRow) continue;
+            const distance = Math.abs(layout.cursorCol - targetCol);
+            if (distance < bestDistance || (distance === bestDistance && layout.cursorCol <= targetCol)) {
+                bestDistance = distance;
+                bestCursor = candidate;
+            }
+        }
+
+        return bestCursor;
     }
 
     private renderStreamingBlock(block: StreamingBlockState, rawText = block.rawText): string {
@@ -1330,8 +2105,7 @@ export class TerminalUi implements InteractiveUi {
     private formatMoreLines(count: number, trace: ToolHistorySnapshot, label?: string): string {
         const noun = count === 1 ? "line" : "lines";
         const subject = label ? ` ${label}` : "";
-        const expand = trace.expanded ? "" : ` (/trace ${trace.displayId} to expand)`;
-        return `+${count} more${subject} ${noun}${expand}`;
+        return `+${count} more${subject} ${noun}`;
     }
 
     private renderEditTrace(trace: ToolHistorySnapshot): string {
@@ -1663,6 +2437,184 @@ export class TerminalUi implements InteractiveUi {
     private renderPanelBlock(lines: Array<{ text: string; style?: AnsiStyle }>, width: number, fillStyle: AnsiStyle): string {
         return this.formatter.renderPanelBlock(lines, width, fillStyle);
     }
+
+    private readStartupAnsiPreview(path?: string | null): string | null {
+        if (!path) return null;
+        try {
+            const content = readFileSync(path, "utf8");
+            return content.length > 0 ? content : null;
+        } catch {
+            return null;
+        }
+    }
+
+    private renderStartupAnsiPreview(ansiPreview: string, card: StartupCard): string {
+        const dimensions = this.getAnsiPreviewDimensions(ansiPreview);
+        if (card.ansiImageMaxWidth === undefined && card.ansiImageMaxHeight === undefined) return ansiPreview;
+
+        const targetWidth = card.ansiImageMaxWidth ?? dimensions.width;
+        const targetHeight = card.ansiImageMaxHeight ?? dimensions.height;
+        if (targetWidth === dimensions.width && targetHeight === dimensions.height) return ansiPreview;
+        return this.resizeAnsiPreview(ansiPreview, targetWidth, targetHeight);
+    }
+
+    private resizeAnsiPreview(ansiPreview: string, targetWidth: number, targetHeight: number): string {
+        const sourceLines = ansiPreview.split("\n").filter((line) => line.length > 0);
+        if (sourceLines.length === 0) return "";
+        const boundedHeight = Math.max(1, Math.min(targetHeight, sourceLines.length));
+        const rowScale = sourceLines.length / boundedHeight;
+        const sampledRows: string[] = [];
+        for (let row = 0; row < boundedHeight; row += 1) {
+            const sourceRow = Math.min(sourceLines.length - 1, Math.floor((row + 0.5) * rowScale));
+            sampledRows.push(this.resizeAnsiLine(sourceLines[sourceRow], targetWidth));
+        }
+        return sampledRows.join("\n");
+    }
+
+    private resizeAnsiLine(line: string, targetWidth: number): string {
+        const cells = this.parseAnsiLineCells(line);
+        if (cells.length === 0 || targetWidth <= 0) return "";
+        const boundedWidth = Math.max(1, Math.min(targetWidth, cells.length));
+        if (boundedWidth === cells.length) return line;
+        const scale = cells.length / boundedWidth;
+        const sampled: string[] = [];
+        for (let column = 0; column < boundedWidth; column += 1) {
+            const sourceColumn = Math.min(cells.length - 1, Math.floor((column + 0.5) * scale));
+            sampled.push(cells[sourceColumn]);
+        }
+        return `${sampled.join("")}\u001b[0m`;
+    }
+
+    private parseAnsiLineCells(line: string): string[] {
+        const cells: string[] = [];
+        let activeAnsi = "";
+        for (let index = 0; index < line.length;) {
+            const escapeMatch = line.slice(index).match(/^\u001b\[[0-?]*[ -/]*[@-~]/);
+            if (escapeMatch) {
+                const sequence = escapeMatch[0];
+                activeAnsi = sequence === "\u001b[0m" ? "" : sequence;
+                index += sequence.length;
+                continue;
+            }
+            const codePoint = line.codePointAt(index);
+            if (codePoint === undefined) break;
+            const char = String.fromCodePoint(codePoint);
+            const charWidth = this.getVisibleTextWidth(char);
+            if (charWidth > 0) cells.push(`${activeAnsi}${char}`);
+            index += char.length;
+        }
+        return cells;
+    }
+
+    private getAnsiPreviewDimensions(ansiPreview: string): { width: number; height: number } {
+        const lines = ansiPreview.split("\n").filter((line) => line.length > 0);
+        const width = lines.reduce((max, line) => Math.max(max, this.getVisibleTextWidth(line)), 0);
+        return { width, height: lines.length };
+    }
+
+    private renderStartupCardBlock(card: StartupCard, ansiPreview: string | null): string {
+        const width = this.getOutputWidth();
+        const borderStyle: AnsiStyle = { fg: "#60a5fa", bold: true };
+        const titleStyle: AnsiStyle = { fg: "#ffffff", bold: true };
+        const metaStyle: AnsiStyle = { fg: "#bfdbfe" };
+        const mutedStyle: AnsiStyle = { fg: "#93a4b8", dim: true };
+        const innerWidth = Math.max(20, width - 4);
+        const title = card.subtitle ? `${card.title} — ${card.subtitle}` : card.title;
+        const rows: Array<{ text: string; style?: AnsiStyle }> = [{ text: title, style: titleStyle }];
+
+        const topLabel = ` ${card.title} `;
+        const horizontal = "─".repeat(Math.max(0, innerWidth - this.getVisibleTextWidth(topLabel)));
+        const lines = [this.styleAnsi(`┌${topLabel}${horizontal}┐`, borderStyle)];
+        lines.push(...rows.flatMap((row) => this.renderBorderedStartupRows(row.text, innerWidth, row.style ?? metaStyle, borderStyle)));
+
+        if (card.imagePath || card.ansiImagePath) {
+            if (ansiPreview) {
+                const renderedPreview = this.renderStartupAnsiPreview(ansiPreview, card);
+                lines.push(...this.renderBorderedAnsiImageRows(renderedPreview, innerWidth, borderStyle));
+            }
+        }
+
+        for (const line of card.lines) {
+            lines.push(...this.renderStartupDetailRows(line, innerWidth, metaStyle)
+                .flatMap((row) => this.renderBorderedStartupRows(row.text, innerWidth, row.style ?? metaStyle, borderStyle)));
+        }
+        lines.push(this.styleAnsi(`└${"─".repeat(innerWidth)}┘`, borderStyle));
+        return lines.join("\n");
+    }
+
+    private renderBorderedStartupRows(text: string, innerWidth: number, textStyle: AnsiStyle, borderStyle: AnsiStyle): string[] {
+        return this.wrapStyledLineWords(text, innerWidth).map((line) => {
+            const visible = this.getVisibleTextWidth(line);
+            const padded = visible >= innerWidth ? line : `${line}${" ".repeat(innerWidth - visible)}`;
+            return `${this.styleAnsi("│", borderStyle)}${this.styleAnsi(padded, textStyle)}${this.styleAnsi("│", borderStyle)}`;
+        });
+    }
+
+    private renderBorderedAnsiImageRows(ansiPreview: string, innerWidth: number, borderStyle: AnsiStyle): string[] {
+        const reset = "\u001b[0m";
+        return ansiPreview.split("\n").map((rawLine) => {
+            const line = this.fitAnsiLineToWidth(rawLine, innerWidth);
+            const visible = this.getVisibleTextWidth(line);
+            const totalPadding = Math.max(0, innerWidth - visible);
+            const leftPadding = " ".repeat(Math.floor(totalPadding / 2));
+            const rightPadding = " ".repeat(totalPadding - leftPadding.length);
+            return `${this.styleAnsi("│", borderStyle)}${leftPadding}${line}${reset}${rightPadding}${this.styleAnsi("│", borderStyle)}`;
+        });
+    }
+
+    private fitAnsiLineToWidth(line: string, width: number): string {
+        const visible = this.getVisibleTextWidth(line);
+        if (visible <= width) return line;
+        let result = "";
+        let columns = 0;
+        for (let index = 0; index < line.length;) {
+            const escapeMatch = line.slice(index).match(/^\u001b\[[0-?]*[ -/]*[@-~]/);
+            if (escapeMatch) {
+                result += escapeMatch[0];
+                index += escapeMatch[0].length;
+                continue;
+            }
+            const codePoint = line.codePointAt(index);
+            if (codePoint === undefined) break;
+            const char = String.fromCodePoint(codePoint);
+            const charWidth = this.getVisibleTextWidth(char);
+            if (columns + charWidth > width) break;
+            result += char;
+            columns += charWidth;
+            index += char.length;
+        }
+        return result;
+    }
+
+    private renderStartupDetailRows(detail: SessionDetailLine, width: number, style: AnsiStyle): Array<{ text: string; style?: AnsiStyle }> {
+        const left = detail.left.trim();
+        const right = detail.right?.trim() ?? "";
+        if (!left && !right) return [];
+        if (!right) return [{ text: left, style }];
+        const label = `${left}:`;
+        const labelWidth = this.getVisibleTextWidth(label);
+        const rightWidth = this.getVisibleTextWidth(right);
+        const gap = width - labelWidth - rightWidth;
+        if (gap >= 2) return [{ text: `${label}${" ".repeat(gap)}${right}`, style }];
+        return [{ text: label, style }, { text: right, style }];
+    }
+
+    private getStartupImageWidthCells(): number {
+        return Math.max(12, Math.min(32, Math.floor(this.getOutputWidth() / 3)));
+    }
+
+    private getStartupImageHeightCells(): number {
+        return Math.max(6, Math.min(18, Math.floor(this.getTerminalHeight() / 4)));
+    }
+
+    private getStartupImageWidthPx(): number {
+        return Math.max(160, Math.min(420, this.getStartupImageWidthCells() * 14));
+    }
+
+    private getStartupImageHeightPx(): number {
+        return Math.max(120, Math.min(360, this.getStartupImageHeightCells() * 24));
+    }
+
     private layoutPrintedBlockLines(text: string, indent: boolean): string[] {
         const prefix = indent ? "" : "";
         const width = Math.max(1, this.getOutputWidth() - this.getVisibleTextWidth(prefix));
@@ -1746,14 +2698,18 @@ export class TerminalUi implements InteractiveUi {
             case "mcp": return { title: { fg: "#f1b2a4", bold: true }, body: { fg: "#f2dfdb", bg: "#201514" } };
             case "local_shell": return { title: { fg: "#c4c7cf", bold: true }, body: { fg: "#e2e4e8", bg: "#17181b" } };
             case "tool_search": return { title: { fg: "#9fd7e8", bold: true }, body: { fg: "#dcf0f5", bg: "#102026" } };
+            case "plan_choice": return { title: { fg: "#fde68a", bold: true }, body: { fg: "#fff7d6", bg: "#1f1a10" } };
+            case "plan_complete": return { title: { fg: "#c4b5fd", bold: true }, body: { fg: "#eee9ff", bg: "#171326" } };
+            case "subagent": return { title: { fg: "#48d1cc", bold: true }, body: { fg: "#d9fbf8", bg: "#10201f" } };
             default: return { title: { fg: this.getTraceColor(trace.status), bold: true }, body: { fg: "#e5e7eb", bg: "#17181b" } };
         }
     }
 
     private getTraceTypeFromToolName(toolName: string): KnownToolTraceDetails["type"] | null {
         switch (toolName) {
-            case "read": case "write": case "edit": case "web_search": case "file_search": case "code_interpreter": case "mcp": case "local_shell": case "tool_search": return toolName;
+            case "read": case "write": case "edit": case "web_search": case "file_search": case "code_interpreter": case "mcp": case "local_shell": case "tool_search": case "plan_choice": case "plan_complete": case "subagent": return toolName;
             case "run_command": return "local_shell";
+            case "spawn_subagent": return "subagent";
             default: return null;
         }
     }
@@ -1775,6 +2731,21 @@ export class TerminalUi implements InteractiveUi {
         }
     }
 
+    private attachResizeHandler(): void {
+        if (this.resizeHandlerAttached) return;
+        if (!process.stdout.isTTY) return;
+        process.stdout.on("resize", this.handleStdoutResize);
+        this.resizeHandlerAttached = true;
+    }
+
+    private detachResizeHandler(): void {
+        if (!this.resizeHandlerAttached) return;
+        process.stdout.off("resize", this.handleStdoutResize);
+        this.resizeHandlerAttached = false;
+    }
+
+    private readonly handleStdoutResize = (): void => this.scheduleResizeRedraw();
+
     private getReasoningBorderColor(level: string): string {
         switch (level) {
             case "off": return "#525252";
@@ -1788,10 +2759,25 @@ export class TerminalUi implements InteractiveUi {
     }
 
     private getTracePanelWidth(): number { return this.getOutputWidth(); }
-    private getTerminalWidth(): number { return process.stdout.columns ?? 80; }
+    private getTerminalWidth(): number {
+        const columns = process.stdout.columns;
+        return Number.isFinite(columns) && columns > 0 ? Math.floor(columns) : this.lastKnownTerminalSize?.columns ?? 80;
+    }
     private getOutputWidth(): number { return Math.max(1, this.getTerminalWidth() - 1); }
     private getTransientFrameWidth(): number { return this.getOutputWidth(); }
-    private getTerminalHeight(): number { return process.stdout.rows ?? 24; }
+    private getTerminalHeight(): number {
+        const rows = process.stdout.rows;
+        return Number.isFinite(rows) && rows > 0 ? Math.floor(rows) : this.lastKnownTerminalSize?.rows ?? 24;
+    }
+    private readTerminalSize(): TerminalSize | null {
+        const columns = process.stdout.columns;
+        const rows = process.stdout.rows;
+        if (!Number.isFinite(columns) || !Number.isFinite(rows) || columns <= 0 || rows <= 0) return null;
+        return { columns: Math.floor(columns), rows: Math.floor(rows) };
+    }
+    private isSameTerminalSize(left: TerminalSize | null, right: TerminalSize | null): boolean {
+        return !!left && !!right && left.columns === right.columns && left.rows === right.rows;
+    }
     private measureRenderedRows(text: string): number { return text.split("\n").reduce((sum, line) => sum + this.measureWrappedLineRows(line, this.getOutputWidth()), 0); }
     private measureWrappedLineRows(line: string, width: number): number { return this.formatter.measureWrappedLineRows(line, width); }
     private normalizeNewlines(text: string): string { return this.formatter.normalizeNewlines(text); }
@@ -1810,5 +2796,26 @@ export class TerminalUi implements InteractiveUi {
     private styleAnsi(text: string, style: AnsiStyle): string { return this.formatter.styleAnsi(text, style); }
     private applyBaseStyle(text: string, style: AnsiStyle): string { return this.formatter.applyBaseStyle(text, style); }
 
-    private writeStdout(text: string): void { process.stdout.write(text); }
+    private batchStdout<T>(operation: () => T): T {
+        this.stdoutBatchDepth += 1;
+        try {
+            return operation();
+        } finally {
+            this.stdoutBatchDepth -= 1;
+            if (this.stdoutBatchDepth === 0 && this.stdoutBatchBuffer.length > 0) {
+                const buffered = this.stdoutBatchBuffer;
+                this.stdoutBatchBuffer = "";
+                process.stdout.write(buffered);
+            }
+        }
+    }
+
+    private writeStdout(text: string): void {
+        if (this.stdoutBatchDepth > 0) {
+            this.stdoutBatchBuffer += text;
+            return;
+        }
+        process.stdout.write(text);
+    }
 }
+
