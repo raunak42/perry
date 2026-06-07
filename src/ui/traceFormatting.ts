@@ -4,6 +4,7 @@ import type {
     KnownToolTraceDetails,
     LocalShellTraceDetails,
     McpTraceDetails,
+    SubagentTraceDetails,
     ToolSearchTraceDetails,
     WebSearchTraceDetails,
 } from "../tools/traceDetails";
@@ -61,14 +62,6 @@ export function buildToolTraceMarkdown(trace: ToolTraceViewModel): string {
     }
 
     return sections.join("\n\n");
-}
-
-export function buildToolTraceHint(trace: ToolTraceViewModel): string {
-    if (trace.expanded) {
-        return `Expanded trace #${trace.displayId}`;
-    }
-
-    return `/trace ${trace.displayId} to expand this trace`;
 }
 
 export function summarizeToolTrace(trace: ToolTraceViewModel): string {
@@ -134,6 +127,15 @@ function buildKnownDetailSections(trace: ToolTraceViewModel): string[] {
 
         case "tool_search":
             return buildToolSearchSections(details, trace.expanded);
+
+        case "plan_choice":
+            return buildPlanChoiceSections(details);
+
+        case "plan_complete":
+            return buildPlanCompleteSections(details, trace.expanded);
+
+        case "subagent":
+            return buildSubagentSections(details, trace.expanded);
 
         default:
             return buildGenericSections(trace);
@@ -311,6 +313,48 @@ function buildToolSearchSections(details: ToolSearchTraceDetails, expanded: bool
     return sections;
 }
 
+function buildPlanChoiceSections(details: Extract<KnownToolTraceDetails, { type: "plan_choice" }>): string[] {
+    const sections = [
+        `**Question** ${escapeMarkdownInline(details.question)}`,
+        `**Selected** ${escapeMarkdownInline(details.selected.label)}${details.selected.description ? ` — ${escapeMarkdownInline(details.selected.description)}` : ""}`,
+    ];
+    return sections;
+}
+
+function buildPlanCompleteSections(details: Extract<KnownToolTraceDetails, { type: "plan_complete" }>, expanded: boolean): string[] {
+    const sections = [
+        `**Decision** ${escapeMarkdownInline(details.actionLabel)}`,
+    ];
+    if (details.summary) {
+        sections.push(`**Summary** ${escapeMarkdownInline(details.summary)}`);
+    }
+    sections.push("**Plan**\n" + codeFence("md", clipContent(details.plan, expanded)));
+    return sections;
+}
+
+function buildSubagentSections(details: SubagentTraceDetails, expanded: boolean): string[] {
+    const sections: string[] = [];
+    if (details.note) {
+        sections.push(`_${escapeMarkdownInline(details.note)}_`);
+    }
+    sections.push(`**Task** ${escapeMarkdownInline(details.task)}`);
+    const modeParts = [
+        `depth ${details.depth}`,
+        `${details.reasoningLevel} thinking`,
+        details.permissionMode,
+        details.planMode ? "plan mode" : undefined,
+        `${details.turnsUsed ?? 0}/${details.maxTurns} turns`,
+    ].filter(Boolean);
+    sections.push(`**Mode** ${modeParts.join(" · ")}`);
+    if (details.context?.trim()) {
+        sections.push("**Context**\n" + codeFence("md", clipContent(details.context, expanded)));
+    }
+    if (details.output?.trim()) {
+        sections.push("**Result**\n" + codeFence("md", clipContent(details.output, expanded, { tail: !expanded })));
+    }
+    return sections;
+}
+
 function summarizeKnownDetails(details: KnownToolTraceDetails): string {
     switch (details.type) {
         case "read":
@@ -329,6 +373,12 @@ function summarizeKnownDetails(details: KnownToolTraceDetails): string {
             return details.command ?? details.workingDirectory ?? details.note ?? "shell";
         case "tool_search":
             return details.tools?.[0]?.name ?? details.note ?? "tool search";
+        case "plan_choice":
+            return details.question;
+        case "plan_complete":
+            return details.summary ?? details.actionLabel;
+        case "subagent":
+            return details.task;
         default:
             return "trace";
     }
