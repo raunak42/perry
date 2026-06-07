@@ -101,6 +101,38 @@ export interface ToolSearchTraceDetails {
     note?: string;
 }
 
+export interface PlanChoiceTraceDetails {
+    type: "plan_choice";
+    question: string;
+    selected: {
+        label: string;
+        value: string;
+        description?: string;
+    };
+}
+
+export interface PlanCompleteTraceDetails {
+    type: "plan_complete";
+    action: "start_work" | "revise_plan" | "cancel";
+    actionLabel: string;
+    plan: string;
+    summary?: string;
+}
+
+export interface SubagentTraceDetails {
+    type: "subagent";
+    task: string;
+    context?: string;
+    maxTurns: number;
+    turnsUsed?: number;
+    depth: number;
+    permissionMode: string;
+    planMode: boolean;
+    reasoningLevel: string;
+    output?: string;
+    note?: string;
+}
+
 export type KnownToolTraceDetails =
     | ReadTraceDetails
     | WriteTraceDetails
@@ -110,4 +142,7 @@ export type KnownToolTraceDetails =
     | CodeInterpreterTraceDetails
     | McpTraceDetails
     | LocalShellTraceDetails
-    | ToolSearchTraceDetails;
+    | ToolSearchTraceDetails
+    | PlanChoiceTraceDetails
+    | PlanCompleteTraceDetails
+    | SubagentTraceDetails;

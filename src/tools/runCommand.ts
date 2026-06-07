@@ -30,7 +30,7 @@ function isAllowedRedirectionTarget(target: string): boolean {
         || normalized === "/proc/self/fd/2";
 }
 
-function detectBlockedFileMutationReason(command: string): string | null {
+export function detectBlockedFileMutationReason(command: string): string | null {
     const normalized = command.toLowerCase();
 
     if (/\bsed\b[^\n]*\s-i(?:\b|[^\w-])/.test(normalized)) {
