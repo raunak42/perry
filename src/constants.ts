@@ -1,5 +1,7 @@
 import os from "node:os";
 import path from "node:path";
+import type { ProjectContextFile } from "./helpers/projectContext";
+import { formatSkillsManifestSection, type SkillDefinition } from "./helpers/skills";
 
 export const authDir = path.join(os.homedir(), ".perry");
 export const authPath = path.join(authDir, "auth.json");
@@ -7,7 +9,7 @@ export const authPath = path.join(authDir, "auth.json");
 export const oauthCallbackPort = 1455;
 export const oauthCallbackUrl = `http://localhost:${oauthCallbackPort}/auth/callback`;
 
-export const systemPrompt = `
+export const baseSystemPrompt = `
 You are Perry, an expert coding assistant operating inside a CLI agent harness. You help users by reading files, executing commands, inspecting projects, debugging issues, editing code, and writing new files.
 
 Available tools:
@@ -17,6 +19,7 @@ Available tools:
 - edit: Make precise exact-text replacements in a single existing file. Use this for changes to existing files.
 - run_command: Execute shell commands on the user's machine. Use it for repo inspection, searching, tests, git, package scripts, and non-file-content shell tasks.
 - web_search: Search the web for current or external information. Use it for companies, people, roles, leadership, news, prices, laws, APIs, docs, package versions, products, or anything likely to have changed.
+- spawn_subagent: When available, spawn a generic Perry subagent for an isolated delegated task. Subagents inherit Perry's current permission mode, plan-mode restrictions, current working directory, and configured subagent thinking level.
 
 Guidelines:
 
@@ -37,7 +40,67 @@ Guidelines:
 - Ask before clearly destructive or risky commands.
 - Never print or repeat secrets, API keys, OAuth tokens, cookies, or credentials.
 - Keep code changes simple and incremental. Prefer functions and plain objects over classes unless clearly useful.
-
-Current working directory: ${process.cwd()}
-Current date: ${new Date().toDateString()}
 `.trim();
+
+function escapeProjectContextPath(filePath: string): string {
+    return filePath
+        .replace(/&/g, "&amp;")
+        .replace(/"/g, "&quot;")
+        .replace(/</g, "&lt;");
+}
+
+export function formatProjectContextSection(contextFiles: ProjectContextFile[]): string {
+    if (contextFiles.length === 0) return "";
+
+    const sections = contextFiles.map((contextFile) => [
+        `<project_instructions path="${escapeProjectContextPath(contextFile.path)}">`,
+        contextFile.content,
+        "</project_instructions>",
+    ].join("\n"));
+
+    return [
+        "<project_context>",
+        "",
+        "Project-specific instructions and guidelines:",
+        "",
+        ...sections.flatMap((section) => [section, ""]),
+        "</project_context>",
+    ].join("\n").trimEnd();
+}
+
+export function formatSelfManifestSection(selfManifest?: ProjectContextFile | null): string {
+    if (!selfManifest) return "";
+
+    return [
+        "<perry_self_manifest>",
+        `Source: ${escapeProjectContextPath(selfManifest.path)}`,
+        "",
+        selfManifest.content,
+        "</perry_self_manifest>",
+    ].join("\n").trimEnd();
+}
+
+export function buildSystemPrompt(options: {
+    contextFiles?: ProjectContextFile[];
+    selfManifest?: ProjectContextFile | null;
+    skills?: SkillDefinition[];
+    cwd?: string;
+    date?: Date;
+} = {}): string {
+    const selfManifestSection = formatSelfManifestSection(options.selfManifest);
+    const skillsSection = formatSkillsManifestSection(options.skills ?? []);
+    const contextSection = formatProjectContextSection(options.contextFiles ?? []);
+    const cwd = path.resolve(options.cwd ?? process.cwd()).replace(/\\/g, "/");
+    const date = options.date ?? new Date();
+
+    return [
+        baseSystemPrompt,
+        selfManifestSection,
+        skillsSection,
+        contextSection,
+        `Current working directory: ${cwd}`,
+        `Current date: ${date.toDateString()}`,
+    ].filter((section) => section.length > 0).join("\n\n");
+}
+
+export const systemPrompt = buildSystemPrompt();
