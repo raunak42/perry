@@ -11,6 +11,9 @@ export type AuthFile = {
     };
 
     openaiCodex?: OpenAICodexTokens;
+
+    modelDefaults?: Partial<Record<"openai-api-key" | "openai-codex", string>>;
+    reasoningDefaults?: Partial<Record<"openai-api-key" | "openai-codex", string>>;
 };
 
 
