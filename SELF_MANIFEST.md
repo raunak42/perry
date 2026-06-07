@@ -30,7 +30,7 @@ Keep this file accurate whenever Perry's user-visible behavior, slash commands, 
 - `/thinking`: choose or set thinking/reasoning level for the current session.
 - `/settings`: configure permissions, context handling, plan mode, subagents mode, subagent thinking, skills, and preferences.
 - `/permissions`: view or change tool permission mode.
-- `/mcp`: show, reload, restart, or refresh MCP servers and tools.
+- `/mcp`: show, diagnose, reload, restart, or refresh MCP servers and tools.
 - `/skills`: list or reload reusable workflow skills.
 - `/skill`: apply a reusable workflow skill to the next request, or clear the active skill.
 - `/plan`: toggle interactive planning mode.
@@ -70,7 +70,7 @@ Keep this file accurate whenever Perry's user-visible behavior, slash commands, 
 - Config shape uses `mcpServers`, with per-server `command`, optional `args`, optional `env`, optional `cwd`, and optional `disabled`.
 - Perry starts configured servers, initializes them, lists tools, and exposes those tools as function tools named like `mcp__server__tool`.
 - MCP calls are routed through Perry's permission system.
-- `/mcp`, `/mcp status`, `/mcp reload`, `/mcp restart`, and `/mcp refresh` are supported.
+- `/mcp`, `/mcp status`, `/mcp tools`, `/mcp doctor`, `/mcp reload`, `/mcp restart`, and `/mcp refresh` are supported.
 - Native HTTP/Streamable HTTP MCP and OAuth MCP are not built in yet; HTTP MCP can be used through a stdio bridge when appropriate.
 
 ## Subagents

@@ -34,7 +34,7 @@ export const SLASH_COMMANDS: SlashCommandDefinition[] = [
     },
     {
         name: "/mcp",
-        description: "Show or reload MCP servers and tools",
+        description: "Show, diagnose, or reload MCP servers and tools",
     },
     {
         name: "/skills",

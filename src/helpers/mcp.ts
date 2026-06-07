@@ -27,10 +27,26 @@ export interface McpLoadedConfig {
     servers: Record<string, McpServerConfig>;
 }
 
+export interface McpConfigError {
+    path: string;
+    message: string;
+}
+
 export interface McpToolInfo {
     name: string;
     description?: string | null;
     inputSchema?: Record<string, unknown>;
+}
+
+export type McpServerRuntimeState = "disabled" | "loading" | "running" | "error";
+
+export interface McpServerRuntimeStatus {
+    name: string;
+    state: McpServerRuntimeState;
+    command?: string;
+    tools: number;
+    error?: string;
+    stderr?: string;
 }
 
 interface PendingRequest {
@@ -56,6 +72,14 @@ function asStringArray(value: unknown): string[] | undefined {
     if (!Array.isArray(value)) return undefined;
     const result = value.filter((item): item is string => typeof item === "string");
     return result.length === value.length ? result : undefined;
+}
+
+function formatErrorMessage(error: unknown): string {
+    return error instanceof Error ? error.message : String(error);
+}
+
+function summarizeCommand(config: McpServerConfig): string {
+    return [config.command, ...(config.args ?? [])].join(" ").trim();
 }
 
 function normalizeServerConfig(value: unknown): McpServerConfig | null {
@@ -93,18 +117,25 @@ export function getMcpConfigPaths(cwd = process.cwd(), homeDir = os.homedir()): 
     ];
 }
 
-export function loadMcpConfig(cwd = process.cwd(), homeDir = os.homedir()): { files: McpLoadedConfig[]; servers: Record<string, McpServerConfig> } {
+export function loadMcpConfig(cwd = process.cwd(), homeDir = os.homedir()): { files: McpLoadedConfig[]; servers: Record<string, McpServerConfig>; errors: McpConfigError[] } {
     const files: McpLoadedConfig[] = [];
     const servers: Record<string, McpServerConfig> = {};
+    const errors: McpConfigError[] = [];
 
     for (const configPath of getMcpConfigPaths(cwd, homeDir)) {
-        const loaded = readMcpConfigFile(configPath);
+        let loaded: McpLoadedConfig | null = null;
+        try {
+            loaded = readMcpConfigFile(configPath);
+        } catch (error) {
+            errors.push({ path: configPath, message: formatErrorMessage(error) });
+            continue;
+        }
         if (!loaded) continue;
         files.push(loaded);
         Object.assign(servers, loaded.servers);
     }
 
-    return { files, servers };
+    return { files, servers, errors };
 }
 
 export function sanitizeMcpToolNamePart(value: string): string {
@@ -336,8 +367,11 @@ export interface McpRegisteredTool {
 
 export class McpManager {
     private clients = new Map<string, StdioMcpClient>();
+    private configs = new Map<string, McpServerConfig>();
     private registeredTools: McpRegisteredTool[] = [];
     private configFiles: string[] = [];
+    private configErrors: McpConfigError[] = [];
+    private serverStatuses = new Map<string, McpServerRuntimeStatus>();
 
     constructor(private readonly cwd = process.cwd(), private readonly homeDir = os.homedir()) {}
 
@@ -345,30 +379,80 @@ export class McpManager {
         return [...this.configFiles];
     }
 
+    get errors(): McpConfigError[] {
+        return [...this.configErrors];
+    }
+
     get tools(): McpRegisteredTool[] {
         return [...this.registeredTools];
     }
 
     get serverNames(): string[] {
-        return [...this.clients.keys()];
+        return [...this.serverStatuses.keys()];
+    }
+
+    get statuses(): McpServerRuntimeStatus[] {
+        return [...this.serverStatuses.values()].map((status) => ({ ...status }));
     }
 
     async load(): Promise<void> {
         await this.close();
         const loaded = loadMcpConfig(this.cwd, this.homeDir);
         this.configFiles = loaded.files.map((file) => file.path);
+        this.configErrors = loaded.errors;
+        this.configs.clear();
+        this.serverStatuses.clear();
         for (const [name, config] of Object.entries(loaded.servers)) {
-            if (config.disabled) continue;
+            this.configs.set(name, config);
+            if (config.disabled) {
+                this.serverStatuses.set(name, {
+                    name,
+                    state: "disabled",
+                    command: summarizeCommand(config),
+                    tools: 0,
+                });
+                continue;
+            }
+            this.serverStatuses.set(name, {
+                name,
+                state: "loading",
+                command: summarizeCommand(config),
+                tools: 0,
+            });
             this.clients.set(name, new StdioMcpClient(name, config, this.cwd));
         }
         await this.refreshTools();
     }
 
     async refreshTools(): Promise<void> {
+        const toolsByServer = new Map<string, McpToolInfo[]>();
+        await Promise.all([...this.clients.entries()].map(async ([serverName, client]) => {
+            try {
+                const listed = await client.listTools();
+                toolsByServer.set(serverName, listed);
+                const config = this.configs.get(serverName);
+                this.serverStatuses.set(serverName, {
+                    name: serverName,
+                    state: "running",
+                    command: config ? summarizeCommand(config) : undefined,
+                    tools: listed.length,
+                    stderr: client.stderr || undefined,
+                });
+            } catch (error) {
+                const config = this.configs.get(serverName);
+                this.serverStatuses.set(serverName, {
+                    name: serverName,
+                    state: "error",
+                    command: config ? summarizeCommand(config) : undefined,
+                    tools: 0,
+                    error: formatErrorMessage(error),
+                    stderr: client.stderr || undefined,
+                });
+            }
+        }));
         const usedNames = new Set<string>();
         const tools: McpRegisteredTool[] = [];
-        for (const [serverName, client] of this.clients.entries()) {
-            const listed = await client.listTools();
+        for (const [serverName, listed] of [...toolsByServer.entries()].sort(([a], [b]) => a.localeCompare(b))) {
             for (const tool of listed) {
                 tools.push({
                     functionName: createMcpFunctionName(serverName, tool.name, usedNames),
@@ -435,18 +519,45 @@ export class McpManager {
         this.registeredTools = [];
     }
 
-    describe(): string {
-        if (this.configFiles.length === 0) {
+    describe(options: { verbose?: boolean; doctor?: boolean } = {}): string {
+        if (this.configFiles.length === 0 && this.configErrors.length === 0) {
             return "MCP: no config files found. Add ~/.perry/mcp.json, .perry/mcp.json, or .mcp.json.";
         }
         const lines = [
-            `MCP config: ${this.configFiles.join(", ")}`,
-            `Servers: ${this.serverNames.length ? this.serverNames.join(", ") : "none enabled"}`,
+            `MCP config: ${this.configFiles.length ? this.configFiles.join(", ") : "none loaded"}`,
+            `Servers: ${this.serverNames.length ? this.serverNames.join(", ") : "none configured"}`,
             `Tools: ${this.registeredTools.length}`,
         ];
-        for (const tool of this.registeredTools) {
-            lines.push(`- ${tool.functionName} (${tool.serverName} · ${tool.tool.name})${tool.tool.description ? ` — ${tool.tool.description}` : ""}`);
+
+        for (const error of this.configErrors) {
+            lines.push(`- config error: ${error.path} — ${error.message}`);
         }
+
+        for (const status of this.statuses) {
+            const stateLabel = status.state === "running"
+                ? `running · ${status.tools} tool${status.tools === 1 ? "" : "s"}`
+                : status.state;
+            lines.push(`- ${status.name}: ${stateLabel}${status.command ? ` — ${status.command}` : ""}`);
+            if (status.error) lines.push(`  error: ${status.error}`);
+            if (options.doctor && status.stderr) lines.push(`  stderr: ${status.stderr}`);
+        }
+
+        if (this.registeredTools.length > 0 && (options.verbose || options.doctor)) {
+            lines.push("Tools:");
+            for (const tool of this.registeredTools) {
+                lines.push(`- ${tool.functionName} (${tool.serverName} · ${tool.tool.name})${tool.tool.description ? ` — ${tool.tool.description}` : ""}`);
+            }
+        } else if (this.registeredTools.length > 0) {
+            lines.push("Run /mcp tools to list tool names, or /mcp doctor for diagnostics.");
+        }
+
+        if (options.doctor) {
+            lines.push("Config locations checked:");
+            for (const configPath of getMcpConfigPaths(this.cwd, this.homeDir)) {
+                lines.push(`- ${configPath}${fs.existsSync(configPath) ? "" : " (missing)"}`);
+            }
+        }
+
         return lines.join("\n");
     }
 }

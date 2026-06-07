@@ -1996,6 +1996,9 @@ async function main(options: CliOptions = {}) {
         await withBusyIndicator(ui, "Reloading MCP servers", () => mcpManager.load());
         mcpTools = createMcpTools(mcpManager);
         rebuildToolLists();
+        if (mcpManager.errors.length > 0) {
+            ui.writeWarning(`MCP config warning: ${mcpManager.errors.length} config file${mcpManager.errors.length === 1 ? "" : "s"} could not be loaded. Run /mcp doctor for details.`);
+        }
     };
     const refreshSkills = async (): Promise<void> => {
         skills = await withBusyIndicator(ui, "Reloading skills", async () => loadSkillDefinitions({ cwd: process.cwd() }));
@@ -2272,8 +2275,16 @@ async function main(options: CliOptions = {}) {
 
                     if (commandName === "/mcp") {
                         const action = commandArgs[0]?.toLowerCase();
-                        if (!action || action === "status" || action === "list") {
+                        if (!action || action === "status") {
                             ui.write(mcpManager.describe());
+                            continue;
+                        }
+                        if (action === "list" || action === "tools") {
+                            ui.write(mcpManager.describe({ verbose: true }));
+                            continue;
+                        }
+                        if (action === "doctor" || action === "diagnose" || action === "diagnostics") {
+                            ui.write(mcpManager.describe({ doctor: true, verbose: true }));
                             continue;
                         }
                         if (["reload", "restart", "refresh"].includes(action)) {
@@ -2287,7 +2298,7 @@ async function main(options: CliOptions = {}) {
                             }
                             continue;
                         }
-                        ui.write("Usage: /mcp [status|reload]");
+                        ui.write("Usage: /mcp [status|tools|doctor|reload]");
                         continue;
                     }
 
