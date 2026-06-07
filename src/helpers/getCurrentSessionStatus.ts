@@ -1,6 +1,8 @@
 import OpenAI from "openai";
 import { getAuthFile } from "./getAuthFile";
-import { getDefaultContextLevel, getDefaultModel, getDefaultReasoningLevel } from "./models";
+import { resolveDefaultModel, resolveDefaultReasoningLevel } from "./modelDefaults";
+import { getDefaultContextLevel } from "./models";
+import { DEFAULT_SUBAGENT_REASONING_LEVEL } from "./subagents";
 import { writeOutput } from "../ui/output";
 import type { State } from "..";
 
@@ -13,16 +15,26 @@ export const getCurrentSessionStatus = async (state: State) => {
             apiKey: auth.openaiApiKey.apiKey,
         });
         state.activeProvider = "openai-api-key";
-        state.currentModel = getDefaultModel("openai-api-key");
-        state.reasoningLevel = getDefaultReasoningLevel();
+        state.currentModel = resolveDefaultModel("openai-api-key", auth);
+        state.reasoningLevel = resolveDefaultReasoningLevel("openai-api-key", state.currentModel, auth);
+        state.subagentReasoningLevel = DEFAULT_SUBAGENT_REASONING_LEVEL;
         state.contextLevel = getDefaultContextLevel();
+        state.permissionMode = "ask";
+        state.planMode = false;
+        state.pendingPlanExecution = false;
+        state.activeSkill = null;
 
         writeOutput("Using saved OpenAI API key.");
     } else if (auth?.activeProvider === "openai-codex" && auth.openaiCodex) {
         state.activeProvider = "openai-codex";
-        state.currentModel = getDefaultModel("openai-codex");
-        state.reasoningLevel = getDefaultReasoningLevel();
+        state.currentModel = resolveDefaultModel("openai-codex", auth);
+        state.reasoningLevel = resolveDefaultReasoningLevel("openai-codex", state.currentModel, auth);
+        state.subagentReasoningLevel = DEFAULT_SUBAGENT_REASONING_LEVEL;
         state.contextLevel = getDefaultContextLevel();
+        state.permissionMode = "ask";
+        state.planMode = false;
+        state.pendingPlanExecution = false;
+        state.activeSkill = null;
         writeOutput("Using saved ChatGPT/Codex subscription login.");
 
     } else {
