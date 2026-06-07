@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "bun:test";
@@ -38,6 +38,63 @@ test("sessions flush only after an assistant response and can be resumed", async
 
         const resolved = await resolveSessionPath(session.getSessionId().slice(0, 8), cwd, dir);
         assert.notEqual(resolved.type, "not_found");
+    } finally {
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("sessions persist completed tool traces and replace updates by trace id", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "perry-session-trace-test-"));
+
+    try {
+        const cwd = process.cwd();
+        const session = SessionManager.create(cwd, dir);
+        session.appendMessage({ role: "user", content: "Read a file." });
+
+        session.appendToolTrace({
+            id: "trace-read-1",
+            displayId: 1,
+            toolName: "read",
+            args: { path: "src/index.ts" },
+            output: "old output",
+            status: "complete",
+            details: {
+                type: "read",
+                path: "src/index.ts",
+                language: "typescript",
+                content: "old output",
+            },
+        });
+
+        assert.equal(existsSync(session.getSessionFile()!), false, "session should still wait to flush until the assistant response");
+
+        session.appendMessage({ role: "assistant", content: "I'll inspect it." });
+        session.appendToolTrace({
+            id: "trace-read-1",
+            displayId: 1,
+            toolName: "read",
+            args: { path: "src/index.ts" },
+            output: "new output",
+            status: "complete",
+            details: {
+                type: "read",
+                path: "src/index.ts",
+                language: "typescript",
+                content: "new output",
+            },
+        });
+
+        const content = readFileSync(session.getSessionFile()!, "utf8");
+        assert.equal((content.match(/"type":"tool_trace"/g) ?? []).length, 1);
+        assert.ok(content.includes("new output"));
+
+        const resumed = SessionManager.open(session.getSessionFile()!, dir, cwd);
+        const traceEntries = resumed.getEntries().filter((entry) => entry.type === "tool_trace");
+        assert.equal(traceEntries.length, 1);
+        assert.equal(traceEntries[0]?.type, "tool_trace");
+        if (traceEntries[0]?.type === "tool_trace") {
+            assert.equal(traceEntries[0].trace.output, "new output");
+        }
     } finally {
         rmSync(dir, { recursive: true, force: true });
     }

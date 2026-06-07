@@ -15,9 +15,16 @@ import { readdir, readFile, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { authDir } from "../constants";
+import {
+    buildContextHistoryFromEntries,
+    type CompactionResult,
+} from "./compaction";
 import type { ContextLevel, ReasoningLevel } from "./models";
+import type { PermissionMode } from "./permissions";
+import type { KnownToolTraceDetails } from "../tools/traceDetails";
+import type { ToolTraceStatus } from "../ui/traceFormatting";
 
-export const CURRENT_SESSION_VERSION = 1;
+export const CURRENT_SESSION_VERSION = 3;
 
 export type PersistedChatMessage = {
     role: "user" | "assistant" | "developer";
@@ -51,14 +58,43 @@ export interface SessionStateSnapshot {
     provider: PersistedProvider;
     model: string;
     reasoningLevel: ReasoningLevel;
+    subagentReasoningLevel?: ReasoningLevel;
     contextLevel: ContextLevel;
+    permissionMode?: PermissionMode;
+    subagentsMode?: boolean;
 }
 
 export interface SessionStateEntry extends SessionEntryBase, SessionStateSnapshot {
     type: "state";
 }
 
-export type SessionEntry = SessionMessageEntry | SessionStateEntry;
+export interface SessionCompactionEntry extends SessionEntryBase {
+    type: "compaction";
+    summary: string;
+    firstKeptEntryId: string;
+    tokensBefore: number;
+}
+
+export interface PersistedToolTrace {
+    id: string;
+    displayId?: number;
+    toolName: string;
+    args?: unknown;
+    argsText?: string;
+    output: string;
+    status: ToolTraceStatus;
+    details?: KnownToolTraceDetails;
+    expanded?: boolean;
+    startedAt?: number;
+    finishedAt?: number;
+}
+
+export interface SessionToolTraceEntry extends SessionEntryBase {
+    type: "tool_trace";
+    trace: PersistedToolTrace;
+}
+
+export type SessionEntry = SessionMessageEntry | SessionStateEntry | SessionCompactionEntry | SessionToolTraceEntry;
 export type SessionFileEntry = SessionHeader | SessionEntry;
 
 export interface SessionInfo {
@@ -301,6 +337,10 @@ export class SessionManager {
             const header = this.fileEntries[0] as SessionHeader;
             this.sessionId = header.id ?? randomUUID();
             this.cwd = header.cwd || this.cwd;
+            if (header.version !== CURRENT_SESSION_VERSION) {
+                header.version = CURRENT_SESSION_VERSION;
+                this.rewriteFile();
+            }
             this.buildIndex();
             this.flushed = true;
             return;
@@ -339,7 +379,7 @@ export class SessionManager {
         for (const entry of this.fileEntries) {
             if (entry.type === "session") continue;
             this.byId.set(entry.id, entry);
-            this.leafId = entry.id;
+            if (entry.type !== "tool_trace") this.leafId = entry.id;
         }
     }
 
@@ -366,7 +406,7 @@ export class SessionManager {
     private appendEntry(entry: SessionEntry): string {
         this.fileEntries.push(entry);
         this.byId.set(entry.id, entry);
-        this.leafId = entry.id;
+        if (entry.type !== "tool_trace") this.leafId = entry.id;
         this.persistEntry(entry);
         return entry.id;
     }
@@ -395,7 +435,48 @@ export class SessionManager {
             provider: snapshot.provider,
             model: snapshot.model,
             reasoningLevel: snapshot.reasoningLevel,
+            subagentReasoningLevel: snapshot.subagentReasoningLevel,
             contextLevel: snapshot.contextLevel,
+            permissionMode: snapshot.permissionMode,
+            subagentsMode: snapshot.subagentsMode,
+        };
+        return this.appendEntry(entry);
+    }
+
+    appendCompaction(result: CompactionResult): string {
+        const entry: SessionCompactionEntry = {
+            type: "compaction",
+            id: generateEntryId(this.byId),
+            parentId: this.leafId,
+            timestamp: new Date().toISOString(),
+            summary: result.summary,
+            firstKeptEntryId: result.firstKeptEntryId,
+            tokensBefore: result.tokensBefore,
+        };
+        return this.appendEntry(entry);
+    }
+
+    appendToolTrace(trace: PersistedToolTrace): string {
+        const existingIndex = this.fileEntries.findIndex((entry) => entry.type === "tool_trace" && entry.trace.id === trace.id);
+        if (existingIndex >= 0) {
+            const existing = this.fileEntries[existingIndex] as SessionToolTraceEntry;
+            const next: SessionToolTraceEntry = {
+                ...existing,
+                timestamp: new Date().toISOString(),
+                trace,
+            };
+            this.fileEntries[existingIndex] = next;
+            this.byId.set(next.id, next);
+            if (this.persist && this.flushed) this.rewriteFile();
+            return next.id;
+        }
+
+        const entry: SessionToolTraceEntry = {
+            type: "tool_trace",
+            id: generateEntryId(this.byId),
+            parentId: this.leafId,
+            timestamp: new Date().toISOString(),
+            trace,
         };
         return this.appendEntry(entry);
     }
@@ -407,6 +488,10 @@ export class SessionManager {
             .filter((message) => message.role === "user" || message.role === "assistant");
     }
 
+    buildContextHistory(): PersistedChatMessage[] {
+        return buildContextHistoryFromEntries(this.getEntries());
+    }
+
     getLatestState(): SessionStateSnapshot | null {
         for (let index = this.fileEntries.length - 1; index >= 0; index -= 1) {
             const entry = this.fileEntries[index];
@@ -415,7 +500,10 @@ export class SessionManager {
                     provider: entry.provider,
                     model: entry.model,
                     reasoningLevel: entry.reasoningLevel,
+                    subagentReasoningLevel: entry.subagentReasoningLevel,
                     contextLevel: entry.contextLevel,
+                    permissionMode: entry.permissionMode,
+                    subagentsMode: entry.subagentsMode,
                 };
             }
         }
@@ -429,6 +517,20 @@ export class SessionManager {
 
     getEntries(): SessionEntry[] {
         return this.fileEntries.filter((entry): entry is SessionEntry => entry.type !== "session");
+    }
+
+    getLatestCompaction(): SessionCompactionEntry | null {
+        for (let index = this.fileEntries.length - 1; index >= 0; index -= 1) {
+            const entry = this.fileEntries[index];
+            if (entry?.type === "compaction") {
+                return entry;
+            }
+        }
+        return null;
+    }
+
+    getCompactionCount(): number {
+        return this.fileEntries.reduce((count, entry) => count + (entry.type === "compaction" ? 1 : 0), 0);
     }
 
     getCwd(): string {
