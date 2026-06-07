@@ -61,11 +61,13 @@ import {
     buildCompactionSummary,
     buildHistorySummaryPrompt,
     buildTurnPrefixSummaryPrompt,
+    estimateContextTokens,
     getCompactionThreshold,
     prepareCompaction,
     SUMMARIZATION_SYSTEM_PROMPT,
     type CompactionResult,
 } from "./helpers/compaction";
+import { formatCompactTokenCount, formatContextUsageLine, type ContextUsageSnapshot } from "./helpers/contextUsage";
 import { extractThinkingTraces, formatThinkingTrace } from "./helpers/reasoning";
 import { setOutputWriter } from "./ui/output";
 import { TerminalUi } from "./ui/terminal-ui";
@@ -90,7 +92,7 @@ import {
     type PermissionEvaluation,
     type PermissionMode,
 } from "./helpers/permissions";
-import type { Response, ResponseInputItem, ResponseOutputItem, ResponseStreamEvent, ResponseUsage } from "openai/resources/responses/responses";
+import type { Response, ResponseCreateParamsNonStreaming, ResponseInputItem, ResponseOutputItem, ResponseStreamEvent, ResponseUsage } from "openai/resources/responses/responses";
 import type { Tool } from "./tools/types";
 import type {
     CodeInterpreterTraceDetails,
@@ -223,7 +225,23 @@ function shouldRenderProviderWarning(error: unknown): boolean {
     return /(?:\b429\b|too many requests|rate.?limit|usage.?limit|quota|limit.*reached)/i.test(message);
 }
 
+function isAbortError(error: unknown): boolean {
+    return error instanceof Error && (error.name === "AbortError" || /aborted|cancelled by escape|stopped by escape|process terminated/i.test(error.message));
+}
+
+function createAbortError(message = "Process terminated."): Error {
+    const error = new Error(message);
+    error.name = "AbortError";
+    return error;
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+    if (signal?.aborted) throw createAbortError();
+}
+
 function formatProviderErrorMessage(error: unknown): string {
+    if (isAbortError(error)) return "Process terminated.";
+
     if (error instanceof ProviderLimitError) {
         const details = error.details;
         const resetText = formatLimitReset(details.resetsAt, details.resetsInSeconds);
@@ -272,17 +290,7 @@ function formatDurationSeconds(totalSeconds: number): string {
 }
 
 function formatCompactCount(value: number): string {
-    if (value >= 1_000_000) {
-        const millions = value / 1_000_000;
-        return `${millions >= 10 ? millions.toFixed(0) : millions.toFixed(1)}M`;
-    }
-
-    if (value >= 1_000) {
-        const thousands = value / 1_000;
-        return `${thousands >= 10 ? thousands.toFixed(0) : thousands.toFixed(1)}k`;
-    }
-
-    return String(value);
+    return formatCompactTokenCount(value);
 }
 
 function formatPercent(value: number): string {
@@ -328,25 +336,25 @@ function getGitBranch(cwd: string): string | null {
     }
 }
 
-function estimateTokenCount(payload: unknown): number {
-    return Math.max(0, Math.ceil(Buffer.byteLength(JSON.stringify(payload), "utf8") / 4));
-}
-
 async function getContextUsageSnapshot(
     state: State,
     history: ChatMessage[],
     systemContext: ChatMessage,
     openaiTools: any[],
-): Promise<{ usedTokens: number | null; approximate: boolean }> {
+    signal?: AbortSignal,
+): Promise<ContextUsageSnapshot> {
     const contextConfig = getContextConfig(state.currentModel, state.contextLevel, state.activeProvider);
+    const input = [systemContext, ...history];
 
     if (state.activeProvider === "openai-api-key" && state.client) {
         try {
             const count = await state.client.responses.inputTokens.count({
                 model: state.currentModel,
-                input: [systemContext, ...history],
+                input,
                 tools: openaiTools,
-            });
+                reasoning: getReasoningConfig(state.reasoningLevel),
+                truncation: contextConfig.truncation,
+            }, { signal });
 
             return {
                 usedTokens: count.input_tokens,
@@ -354,13 +362,7 @@ async function getContextUsageSnapshot(
             };
         } catch {
             return {
-                usedTokens: estimateTokenCount({
-                    model: state.currentModel,
-                    input: [systemContext, ...history],
-                    tools: openaiTools,
-                    truncation: contextConfig.truncation,
-                    context_management: contextConfig.context_management,
-                }),
+                usedTokens: estimateContextTokens(input),
                 approximate: true,
             };
         }
@@ -368,14 +370,7 @@ async function getContextUsageSnapshot(
 
     if (state.activeProvider === "openai-codex") {
         return {
-            usedTokens: estimateTokenCount({
-                model: state.currentModel,
-                instructions: systemContext.content,
-                input: history,
-                tools: openaiTools,
-                truncation: contextConfig.truncation,
-                context_management: contextConfig.context_management,
-            }),
+            usedTokens: estimateContextTokens(input),
             approximate: true,
         };
     }
@@ -405,19 +400,7 @@ async function buildPromptSessionDetails(
 
     const repoLine = branch ? `${repoPath} (${branch})` : repoPath;
 
-    const contextLine = (() => {
-        if (contextUsage.usedTokens !== null && modelMeta.contextWindow) {
-            const percent = Math.max(0, Math.min(999, (contextUsage.usedTokens / modelMeta.contextWindow) * 100));
-            const percentLabel = percent >= 10 ? `${Math.round(percent)}%` : `${percent.toFixed(1)}%`;
-            return `context [${contextUsage.approximate ? "~" : ""}${percentLabel}/${formatCompactCount(modelMeta.contextWindow)}]`;
-        }
-
-        if (contextUsage.usedTokens !== null) {
-            return `context [${contextUsage.approximate ? "~" : ""}${formatCompactCount(contextUsage.usedTokens)}]`;
-        }
-
-        return "context [—]";
-    })();
+    const contextLine = formatContextUsageLine(contextUsage, modelMeta.contextWindow);
 
     return [
         {
@@ -561,7 +544,7 @@ function describeSession(sessionManager: SessionManager, history: ChatMessage[])
     ].join("\n");
 }
 
-async function runCompactionSummaryRequest(state: State, promptText: string): Promise<string> {
+async function runCompactionSummaryRequest(state: State, promptText: string, signal?: AbortSignal): Promise<string> {
     if (state.activeProvider === "openai-api-key") {
         if (!state.client) {
             throw new Error("OpenAI API key client is not available. Run /login again.");
@@ -580,7 +563,7 @@ async function runCompactionSummaryRequest(state: State, promptText: string): Pr
             reasoning: getReasoningConfig(state.reasoningLevel),
             text: { verbosity: "medium" },
             store: false,
-        });
+        }, { signal });
 
         const summary = response.output_text.trim();
         if (!summary) {
@@ -597,6 +580,7 @@ async function runCompactionSummaryRequest(state: State, promptText: string): Pr
             reasoningLevel: state.reasoningLevel,
             contextLevel: "disabled",
             tools: [],
+            signal,
         });
 
         const summary = response.output_text.trim();
@@ -613,6 +597,7 @@ async function compactSessionContext(
     state: State,
     sessionManager: SessionManager,
     customInstructions?: string,
+    signal?: AbortSignal,
 ): Promise<CompactionResult> {
     const entries = sessionManager.getEntries();
     const preparation = prepareCompaction(entries);
@@ -632,11 +617,12 @@ async function compactSessionContext(
                 preparation.previousSummary,
                 customInstructions,
             ),
+            signal,
         )
         : Promise.resolve(preparation.previousSummary ?? "No prior history.");
 
     const turnPrefixSummaryPromise = preparation.isSplitTurn && preparation.turnPrefixMessages.length > 0
-        ? runCompactionSummaryRequest(state, buildTurnPrefixSummaryPrompt(preparation.turnPrefixMessages))
+        ? runCompactionSummaryRequest(state, buildTurnPrefixSummaryPrompt(preparation.turnPrefixMessages), signal)
         : Promise.resolve<string | undefined>(undefined);
 
     const [historySummary, turnPrefixSummary] = await Promise.all([
@@ -656,6 +642,7 @@ async function maybeAutoCompactSessionContext(
     openaiTools: any[],
     pendingUserText: string,
     ui: InteractiveUi,
+    signal?: AbortSignal,
 ): Promise<boolean> {
     const threshold = getCompactionThreshold(state.currentModel, state.contextLevel, state.activeProvider);
     if (threshold === null) {
@@ -669,14 +656,14 @@ async function maybeAutoCompactSessionContext(
 
     const candidateContext = [...sessionManager.buildContextHistory(), { role: "user" as const, content: pendingUserText }];
     return withBusyIndicator(ui, "Checking context", async (indicator) => {
-        const usage = await getContextUsageSnapshot(state, candidateContext, systemContext, filterProviderToolsForSubagentsMode(filterProviderToolsForPlanMode(openaiTools, state.planMode), state.subagentsMode));
+        const usage = await getContextUsageSnapshot(state, candidateContext, systemContext, filterProviderToolsForSubagentsMode(filterProviderToolsForPlanMode(openaiTools, state.planMode), state.subagentsMode), signal);
         if (usage.usedTokens === null || usage.usedTokens < threshold) {
             return false;
         }
 
         ui.write(`Context is getting large (${formatCompactCount(usage.usedTokens)} tokens). Compacting earlier conversation before continuing.`);
         indicator.setMessage("Compacting context");
-        await compactSessionContext(state, sessionManager);
+        await compactSessionContext(state, sessionManager, undefined, signal);
         ui.write("Session context compacted.");
         return true;
     });
@@ -1540,11 +1527,12 @@ async function executeLocalToolCall(
     toolCall: Extract<ResponseOutputItem, { type: "function_call" }>,
     localTools: Array<Tool<any, any>>,
     ui: InteractiveUi,
-    options: { planMode?: boolean; permissionMode?: PermissionMode; promptForPermission?: (evaluation: PermissionEvaluation) => Promise<boolean> } = {},
+    options: { planMode?: boolean; permissionMode?: PermissionMode; promptForPermission?: (evaluation: PermissionEvaluation) => Promise<boolean>; signal?: AbortSignal } = {},
 ): Promise<{ output: string; modelOutput?: ResponseInputItem.FunctionCallOutput["output"]; isError: boolean; details?: unknown }> {
     let args: unknown;
 
     try {
+        throwIfAborted(options.signal);
         args = JSON.parse(toolCall.arguments);
     } catch (error) {
         const message = `Invalid tool arguments for ${toolCall.name}: ${formatToolExecutionError(error)}`;
@@ -1623,7 +1611,9 @@ async function executeLocalToolCall(
     }
 
     try {
+        throwIfAborted(options.signal);
         const result = await tool.execute(args as never, {
+            signal: options.signal,
             onUpdate: (update) => {
                 ui.updateToolExecution(toolCall.call_id, update.output, !!update.isError, update.details);
             },
@@ -1636,7 +1626,7 @@ async function executeLocalToolCall(
             details: result.details,
         };
     } catch (error) {
-        const message = formatToolExecutionError(error);
+        const message = isAbortError(error) ? "Process terminated." : formatToolExecutionError(error);
         ui.finishToolExecution(toolCall.call_id, message, true);
         return {
             output: message,
@@ -1653,7 +1643,7 @@ async function getApiKeyResponse(
     reasoningLevel: ReasoningLevel,
     contextLevel: ContextLevel,
     ui: InteractiveUi,
-    options: { streamOutput?: boolean } = {},
+    options: { streamOutput?: boolean; signal?: AbortSignal } = {},
 ): Promise<{ response: Response; streamedThinking: boolean; streamedOutputText: boolean; rateLimit: RateLimitSnapshot | null }> {
     const thinking = options.streamOutput === false ? null : createThinkingTraceStreamer(ui);
     const outputText = options.streamOutput === false ? null : createAssistantTextStreamer(ui);
@@ -1674,7 +1664,7 @@ async function getApiKeyResponse(
         ],
         store: false,
         stream: true,
-    }).withResponse();
+    }, { signal: options.signal }).withResponse();
 
     let finalResponse: Response | null = null;
     let retainAssistantStream = true;
@@ -1752,6 +1742,7 @@ async function runSubagentLoop(params: {
     providerTools: any[];
     ui: InteractiveUi;
     promptForPermission: (evaluation: PermissionEvaluation) => Promise<boolean>;
+    signal?: AbortSignal;
 }): Promise<{ output: string; turnsUsed: number; details: SubagentTraceDetails }> {
     const { state, task, ui } = params;
     if (task.depth > MAX_SUBAGENT_DEPTH) {
@@ -1809,6 +1800,7 @@ async function runSubagentLoop(params: {
                     ...params,
                     task: childTask,
                     tools: params.tools,
+                    signal: options?.signal,
                 });
                 options?.onUpdate?.({ output: childResult.output, details: childResult.details });
                 return { output: childResult.output, modelOutput: childResult.output, details: childResult.details };
@@ -1825,6 +1817,7 @@ async function runSubagentLoop(params: {
     let turnsUsed = 0;
 
     while (turnsUsed < task.maxTurns) {
+        throwIfAborted(params.signal);
         turnsUsed += 1;
         ui.setStatus(`Running subagent (${turnsUsed}/${task.maxTurns})`);
 
@@ -1838,7 +1831,7 @@ async function runSubagentLoop(params: {
                 reasoningLevel,
                 state.contextLevel,
                 ui,
-                { streamOutput: false },
+                { streamOutput: false, signal: params.signal },
             );
             aiResponse = streamed.response;
         } else {
@@ -1849,6 +1842,7 @@ async function runSubagentLoop(params: {
                 contextLevel: state.contextLevel,
                 tools: providerTools,
                 instructions: systemMessage.content,
+                signal: params.signal,
             });
         }
 
@@ -1884,6 +1878,7 @@ async function runSubagentLoop(params: {
                 planMode: state.planMode,
                 permissionMode: state.permissionMode,
                 promptForPermission: params.promptForPermission,
+                signal: params.signal,
             });
             toolOutputs.push({
                 type: "function_call_output",
@@ -1943,6 +1938,15 @@ async function main(options: CliOptions = {}) {
     });
     let systemContext: ChatMessage = buildBaseSystemContext();
     let promptController: ReturnType<typeof createPersistentPromptController>;
+    let activeTurnAbortController: AbortController | null = null;
+    const requestStopActiveTurn = (): void => {
+        if (activeTurnAbortController && !activeTurnAbortController.signal.aborted) {
+            activeTurnAbortController.abort();
+            ui.setStatus("Stopping...");
+        }
+        ui.cancelActiveInput();
+    };
+    const unsubscribeEscape = ui.onEscape?.(requestStopActiveTurn);
     const planModeInteractionTools = createPlanModeInteractionTools({
         choose: async (prompt, options, initialValue) => {
             await promptController.pause();
@@ -2138,6 +2142,7 @@ async function main(options: CliOptions = {}) {
 
     spawnSubagentTool = createSpawnSubagentTool({
         run: async (task, options) => {
+            throwIfAborted(options?.signal);
             const initialDetails = {
                 type: "subagent" as const,
                 task: task.task,
@@ -2159,6 +2164,7 @@ async function main(options: CliOptions = {}) {
                 providerTools: openaiTools,
                 ui,
                 promptForPermission: promptForPermissionApproval,
+                signal: options?.signal,
             });
             options?.onUpdate?.({ output: result.output, details: result.details });
             return {
@@ -2249,12 +2255,17 @@ async function main(options: CliOptions = {}) {
 
                     if (commandName === "/compact") {
                         try {
-                            const result = await withBusyIndicator(ui, "Compacting context", () => compactSessionContext(state, sessionManager, commandArgs.join(" ").trim() || undefined));
+                            const commandAbortController = new AbortController();
+                            activeTurnAbortController = commandAbortController;
+                            const result = await withBusyIndicator(ui, "Compacting context", () => compactSessionContext(state, sessionManager, commandArgs.join(" ").trim() || undefined, commandAbortController.signal));
                             ui.write(`Session compacted. Earlier conversation was replaced with a checkpoint summary (~${formatCompactCount(result.tokensBefore)} tokens before compaction).`);
                         } catch (error) {
                             const message = formatProviderErrorMessage(error);
-                            if (shouldRenderProviderWarning(error)) ui.writeWarning(message);
+                            if (isAbortError(error)) ui.writeError(message);
+                            else if (shouldRenderProviderWarning(error)) ui.writeWarning(message);
                             else ui.write(message);
+                        } finally {
+                            activeTurnAbortController = null;
                         }
                         continue;
                     }
@@ -2377,6 +2388,12 @@ async function main(options: CliOptions = {}) {
                     if (shouldContinue === false) {
                         break;
                     }
+                } catch (error) {
+                    if (isAbortError(error)) {
+                        ui.write("Cancelled.");
+                        continue;
+                    }
+                    throw error;
                 } finally {
                     promptController.resume();
                 }
@@ -2412,12 +2429,21 @@ async function main(options: CliOptions = {}) {
                     void refreshPromptSessionDetails().catch(() => undefined);
                 }
             };
+            const turnAbortController = new AbortController();
+            activeTurnAbortController = turnAbortController;
+            const turnSignal = turnAbortController.signal;
 
             try {
                 if (!planModeForTurn) {
-                    await maybeAutoCompactSessionContext(state, sessionManager, systemContextForTurn, openaiTools, answer, ui);
+                    await maybeAutoCompactSessionContext(state, sessionManager, systemContextForTurn, openaiTools, answer, ui, turnSignal);
                 }
             } catch (error) {
+                if (isAbortError(error)) {
+                    ui.writeError("Process terminated.");
+                    activeTurnAbortController = null;
+                    activeSkillForTurn && clearActiveSkillForTurn();
+                    continue;
+                }
                 const message = error instanceof Error ? `Auto-compaction failed. ${error.message}` : `Auto-compaction failed. ${String(error)}`;
                 ui.write(message);
             }
@@ -2469,7 +2495,8 @@ async function main(options: CliOptions = {}) {
                             state.currentModel,
                             state.reasoningLevel,
                             state.contextLevel,
-                            ui
+                            ui,
+                            { signal: turnSignal }
                         );
                         aiResponse = streamedResponse.response;
                         streamedThinking = streamedResponse.streamedThinking;
@@ -2489,6 +2516,7 @@ async function main(options: CliOptions = {}) {
                                 contextLevel: state.contextLevel,
                                 tools: activeTools,
                                 instructions: systemContextForTurn.content,
+                                signal: turnSignal,
                             }, {
                                 onReasoningStart: (itemId) => thinking.onStart(itemId),
                                 onReasoningDelta: (itemId, delta) => thinking.onDelta(itemId, delta),
@@ -2558,11 +2586,14 @@ async function main(options: CliOptions = {}) {
 
                         for (const toolCall of toolCalls) {
                             ui.setStatus(`Running tool: ${toolCall.name}`);
+                            throwIfAborted(turnSignal);
                             const toolResult = await executeLocalToolCall(toolCall, activeLocalTools, ui, {
                                 planMode: planModeForTurn,
                                 permissionMode: state.permissionMode,
                                 promptForPermission: promptForPermissionApproval,
+                                signal: turnSignal,
                             });
+                            throwIfAborted(turnSignal);
                             toolOutputs.push({
                                 type: "function_call_output",
                                 call_id: toolCall.call_id,
@@ -2689,14 +2720,19 @@ async function main(options: CliOptions = {}) {
                 }
             } catch (error) {
                 const message = formatProviderErrorMessage(error);
-                if (shouldRenderProviderWarning(error)) ui.writeWarning(message);
+                if (isAbortError(error)) ui.writeError(message);
+                else if (shouldRenderProviderWarning(error)) ui.writeWarning(message);
                 else ui.write(message);
                 ui.clearBusy();
                 lastTurnElapsedMs = Date.now() - turnStartedAt;
                 lastTurnUsage = snapshotTurnUsage(turnUsage);
+                clearActiveSkillForTurn();
                 continue;
             } finally {
                 ui.clearBusy();
+                if (activeTurnAbortController === turnAbortController) {
+                    activeTurnAbortController = null;
+                }
             }
         }
     } catch (err) {
@@ -2705,6 +2741,7 @@ async function main(options: CliOptions = {}) {
         }
     } finally {
         unsubscribeToolTracePersistence?.();
+        unsubscribeEscape?.();
         promptController.stop();
         await mcpManager.close();
         setOutputWriter(null);

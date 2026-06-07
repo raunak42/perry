@@ -33,6 +33,10 @@ class FakeUi implements InteractiveUi {
         this.writes.push(message);
     }
 
+    writeError(message: string): void {
+        this.writes.push(message);
+    }
+
     writeUser(message: string): void {
         this.writes.push(message);
     }
@@ -73,6 +77,7 @@ class FakeUi implements InteractiveUi {
     setBusy(): void {}
     clearBusy(): void {}
     cancelActiveInput(): void {}
+    triggerEscape(): void {}
     destroy(): void {}
 }
 

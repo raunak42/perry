@@ -41,10 +41,12 @@ export type PersistableToolTrace = {
 };
 
 export interface InteractiveUi {
+    onEscape?(listener: () => void): () => void;
     ask(prompt: string, options?: PromptOptions): Promise<string>;
     choose<T = string>(prompt: string, options: ChoiceOption<T>[], initialValue?: T): Promise<T>;
     write(message: string): void;
     writeWarning(message: string): void;
+    writeError(message: string): void;
     writeUser(message: string): void;
     writeAssistant(message: string): void;
     writeThinking(message: string): void;
@@ -75,5 +77,6 @@ export interface InteractiveUi {
     setBusy(message?: string): void;
     clearBusy(options?: { showWorkedLine?: boolean }): void;
     cancelActiveInput(): void;
+    triggerEscape(): void;
     destroy(): void;
 }

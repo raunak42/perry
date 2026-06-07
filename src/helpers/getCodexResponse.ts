@@ -13,6 +13,7 @@ type GetCodexResponseParams = {
     reasoningLevel: ReasoningLevel;
     contextLevel: ContextLevel;
     tools?: unknown[];
+    signal?: AbortSignal;
 };
 
 export type CodexResponseStreamHooks = {
@@ -188,6 +189,7 @@ export async function getCodexResponse(
             method: "POST",
             headers,
             body: JSON.stringify(body),
+            signal: params.signal,
         });
     };
 

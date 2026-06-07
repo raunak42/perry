@@ -336,6 +336,45 @@ async function assertPromptShiftTabCyclesReasoningLevel(): Promise<void> {
     assert.equal(cycles, 1);
 }
 
+async function assertPromptBorderStaysTurquoiseForAllReasoningLevels(): Promise<void> {
+    const raw = await captureTerminalOutput(80, 20, async (ui) => {
+        const prompt = ui.ask(">", { placeholder: "Type a message" }).catch(() => undefined);
+        await wait(1);
+        for (const level of ["off", "minimal", "low", "medium", "high", "xhigh"]) {
+            ui.setReasoningLevel(level);
+            await wait(1);
+        }
+        ui.cancelActiveInput();
+        await prompt;
+    });
+
+    assert.ok(raw.includes("\u001b[38;2;72;209;204m"), "prompt border should use turquoise");
+    for (const ansi of [
+        "\u001b[38;2;82;82;82m",
+        "\u001b[38;2;107;114;128m",
+        "\u001b[38;2;34;197;94m",
+        "\u001b[38;2;234;179;8m",
+        "\u001b[38;2;249;115;22m",
+        "\u001b[38;2;217;70;239m",
+    ]) {
+        assert.equal(raw.includes(ansi), false, `prompt border should not use reasoning-level color ${ansi}`);
+    }
+}
+
+async function assertStartupCardUsesTurquoiseBorder(): Promise<void> {
+    const raw = await captureTerminalOutput(80, 20, async (ui) => {
+        ui.writeStartupCard({
+            title: "Perry",
+            subtitle: "test",
+            lines: [{ left: "session", right: "test-session" }],
+        });
+    });
+
+    assert.ok(raw.includes("\u001b[1;38;2;72;209;204m┌ Perry "), "startup card border should use bold turquoise");
+    assert.ok(raw.includes("\u001b[1;38;2;72;209;204m│"), "startup card side borders should use bold turquoise");
+    assert.equal(raw.includes("\u001b[1;38;2;96;165;250m┌ Perry "), false, "startup card should not use the old blue border");
+}
+
 async function assertPromptUpDownNavigatesHistory(): Promise<void> {
     await captureTerminalOutput(80, 20, async (ui) => {
         const prompt = ui.ask(">", {
@@ -401,6 +440,35 @@ async function assertPromptBracketedPastePreservesMultilineTextWithoutSubmitting
         emitPromptKey("", { name: "return" });
         assert.equal(await prompt, "first line\nsecond line\nthird line");
     });
+}
+
+async function assertEscapeTriggersGlobalStopListener(): Promise<void> {
+    await captureTerminalOutput(80, 20, async (ui) => {
+        let triggered = 0;
+        const unsubscribe = ui.onEscape(() => { triggered += 1; });
+        emitPromptKey("", { name: "escape" });
+        await wait(5);
+        unsubscribe();
+        assert.equal(triggered, 1);
+    });
+}
+
+async function assertPromptEscapeRejectsPrompt(): Promise<void> {
+    await captureTerminalOutput(80, 20, async (ui) => {
+        const prompt = ui.ask(">", { placeholder: "Type a message" });
+        await wait(1);
+        emitPromptKey("", { name: "escape" });
+        await assert.rejects(prompt, (error: unknown) => error instanceof Error && error.name === "AbortError");
+    });
+}
+
+async function assertWriteErrorRendersRedProcessTerminated(): Promise<void> {
+    const raw = await captureTerminalOutput(80, 20, async (ui) => {
+        ui.writeError("Process terminated.");
+    });
+
+    assert.match(stripAnsi(raw), /Process terminated\./);
+    assert.match(raw, /\u001b\[[0-9;]*38;2;248;113;113[0-9;]*m/, "error title should use red foreground styling");
 }
 
 async function assertPromptCursorDoesNotWrapBeforeInputFrameExpands(): Promise<void> {
@@ -786,7 +854,7 @@ async function assertActivePromptBusySpinnerDoesNotRedrawPromptEveryTick(): Prom
         await wait(1);
         ui.setSessionDetails([
             { left: "~/repos/new-projects/perry-new (main)" },
-            { left: "context [46%/400k]", right: "gpt-5.4 · high" },
+            { left: "context [184k/400k · 46%]", right: "gpt-5.4 · high" },
         ]);
         ui.setBusy("Thinking");
         await wait(350);
@@ -804,7 +872,7 @@ async function assertActivePromptBusySpinnerDoesNotRedrawPromptEveryTick(): Prom
     }
 
     const promptFrameWrites = writes.filter((write) => write.includes("─".repeat(8)) && write.includes("Type a message")).length;
-    const sessionLineWrites = writes.filter((write) => write.includes("context [46%/400k]")).length;
+    const sessionLineWrites = writes.filter((write) => write.includes("context [184k/400k · 46%]")).length;
     const clearTailCount = (raw.match(/\u001b\[J/g) ?? []).length;
     assert.ok(promptFrameWrites <= 5, `busy spinner redrew prompt frame too often: ${promptFrameWrites}`);
     assert.ok(sessionLineWrites <= 4, `busy spinner redrew session metadata too often: ${sessionLineWrites}`);
@@ -883,7 +951,7 @@ async function assertActivePromptSlowStreamingKeepsSessionDetailsVisible(): Prom
         await wait(1);
         ui.setSessionDetails([
             { left: "~/repos/new-projects/perry-new (main)" },
-            { left: "context [46%/400k]", right: "gpt-5.4 · high" },
+            { left: "context [184k/400k · 46%]", right: "gpt-5.4 · high" },
         ]);
         ui.setBusy("Thinking");
         const blockId = ui.startStreamingBlock();
@@ -906,12 +974,12 @@ async function assertActivePromptSlowStreamingKeepsSessionDetailsVisible(): Prom
         else delete (process.stdout as unknown as { rows?: number }).rows;
     }
 
-    const sessionLineWrites = writes.filter((write) => write.includes("context [46%/400k]")).length;
+    const sessionLineWrites = writes.filter((write) => write.includes("context [184k/400k · 46%]")).length;
     assert.ok(sessionLineWrites > 0, "slow streaming did not restore session metadata");
     for (const word of ["Slow", "streaming", "chunks", "should", "not", "flash."]) {
         assert.match(raw, new RegExp(word.replace(".", "\\.")));
     }
-    assert.match(screenBeforeCleanup, /context \[46%\/400k\]/);
+    assert.match(screenBeforeCleanup, /context \[184k\/400k · 46%\]/);
 }
 
 async function assertCumulativeSnapshotDeltasDoNotPrintRepeatedPrefixes(): Promise<void> {
@@ -1168,7 +1236,7 @@ async function assertPromptRendersRepoAndContextMetadataBelowInput(): Promise<vo
     try {
         ui.setSessionDetails([
             { left: "~/repos/new-projects/perry-new (main)" },
-            { left: "context [46%/400k]", right: "gpt-5.4 · high" },
+            { left: "context [184k/400k · 46%]", right: "gpt-5.4 · high" },
         ]);
         await wait(5);
         ui.cancelActiveInput();
@@ -1185,9 +1253,9 @@ async function assertPromptRendersRepoAndContextMetadataBelowInput(): Promise<vo
 
     const transcript = raw.replace(/\u001b\[[0-9;?]*[A-Za-z]/g, "").replace(/\r/g, "\n");
     assert.match(transcript, /~\/repos\/new-projects\/perry-new \(main\)/);
-    const metadataLine = transcript.split("\n").find((line) => line.includes("context [46%/400k]"));
+    const metadataLine = transcript.split("\n").find((line) => line.includes("context [184k/400k · 46%]"));
     assert.ok(metadataLine, `prompt metadata line missing.\n${transcript}`);
-    assert.match(metadataLine!, /^context \[46%\/400k\]\s{3,}gpt-5\.4 · high$/);
+    assert.match(metadataLine!, /^context \[184k\/400k · 46%\]\s{3,}gpt-5\.4 · high$/);
 }
 
 async function assertThinkingStreamUsesRemainingLineWidthBeforeWrapping(): Promise<void> {
@@ -1369,6 +1437,9 @@ test("streaming merge keeps common chunks", async () => {
 });
 
 test("prompt Shift+Tab cycles reasoning level", assertPromptShiftTabCyclesReasoningLevel);
+test("prompt border stays turquoise for all reasoning levels", assertPromptBorderStaysTurquoiseForAllReasoningLevels);
+test("startup card uses turquoise border", assertStartupCardUsesTurquoiseBorder);
+test("writeError renders process terminated in red", assertWriteErrorRendersRedProcessTerminated);
 test("prompt up/down navigates message history", assertPromptUpDownNavigatesHistory);
 test("prompt up moves within wrapped draft before history", assertPromptUpMovesWithinWrappedDraftBeforeHistory);
 test("prompt bracketed paste preserves multiline text without submitting", assertPromptBracketedPastePreservesMultilineTextWithoutSubmitting);

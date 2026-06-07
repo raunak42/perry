@@ -105,6 +105,7 @@ Keep this file accurate whenever Perry's user-visible behavior, slash commands, 
 - Perry stores local sessions unless disabled with `--no-session`.
 - Perry persists completed tool traces, including reads, writes, edits, shell/tool calls, MCP calls, plan interactions, and subagent traces, so resumed sessions can replay trace cards in transcript order.
 - Perry supports `/resume`, `/continue`, and `/new` for local sessions.
+- Perry's prompt metadata shows context usage as used tokens / context window plus percent, e.g. `context [184k/400k · 46%]`; approximate estimates are prefixed with `~`.
 - Perry supports manual `/compact` and automatic context compaction, with loaders for slow operations.
 
 ## TUI behavior
@@ -115,7 +116,9 @@ Keep this file accurate whenever Perry's user-visible behavior, slash commands, 
 - Busy loaders/spinners and elapsed timers should keep animating without redrawing the entire prompt frame at high frequency.
 - Tool traces show live elapsed time while running.
 - Shared choice UI is used for plan questions, settings/model/skill pickers, slash-command suggestions, and permission prompts.
+- The input prompt border uses a consistent Perry-like teal color regardless of the active reasoning/thinking level.
 - Highlighted choice options use bold Perry-like teal styling, consistent option layout, and a windowed list with an `(x/y)` indicator for long lists.
+- Pressing Escape cancels the active prompt/choice or stops the currently running agent turn, including streamed provider requests and abort-aware local tools such as shell/MCP calls.
 - When Perry needs user action during an agent flow, it plays the same sound used when a response finishes.
 
 ## Image and clipboard support
@@ -129,7 +132,7 @@ Keep this file accurate whenever Perry's user-visible behavior, slash commands, 
 ## Startup and providers
 
 - Perry can use an OpenAI API key provider or a ChatGPT/Codex provider.
-- The startup card shows session, provider/model, subagents mode/thinking, context, permissions, plan mode, current directory, and loaded context files.
+- The startup card shows session, provider/model, subagents mode/thinking, context, permissions, plan mode, current directory, and loaded context files, with a Perry-like teal border.
 - Perry saves the selected `/model` model and reasoning level per provider in its auth/preferences file, so future starts with that provider use the same model and thinking.
 - Startup image paths can be configured with Perry startup-image environment variables.
 

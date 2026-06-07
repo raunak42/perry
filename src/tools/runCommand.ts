@@ -79,13 +79,14 @@ function getTimeoutSeconds(input: RunCommandInput): number | null {
     return DEFAULT_TIMEOUT_SECONDS;
 }
 
-function killProcessGroup(pid: number): void {
+function killProcessGroup(pid: number, signal: NodeJS.Signals = "SIGTERM"): void {
     try {
         if (process.platform === "win32") {
-            process.kill(pid);
+            process.kill(pid, signal);
             return;
         }
-        process.kill(-pid, "SIGTERM");
+        process.kill(-pid, signal);
+        if (signal === "SIGKILL") return;
         setTimeout(() => {
             try {
                 process.kill(-pid, "SIGKILL");
@@ -95,7 +96,7 @@ function killProcessGroup(pid: number): void {
         }, 2_000).unref?.();
     } catch {
         try {
-            process.kill(pid, "SIGTERM");
+            process.kill(pid, signal);
         } catch {
             // Already exited or inaccessible.
         }
@@ -168,10 +169,15 @@ export const runCommandTool: Tool<RunCommandInput> = {
             let stderr = "";
             let settled = false;
             let timedOut = false;
+            let aborted = false;
             const startedAt = Date.now();
 
             const buildOutput = (exitCode?: number | null): string => {
                 const base = formatCommandOutput(stdout, stderr, exitCode);
+                if (aborted) {
+                    const abortMessage = "Process terminated.";
+                    return base ? `${base}\n${abortMessage}` : abortMessage;
+                }
                 if (!timedOut) return base;
                 const timeoutMessage = `Command timed out after ${timeoutSeconds} seconds.`;
                 return base ? `${base}\n${timeoutMessage}` : timeoutMessage;
@@ -184,9 +190,17 @@ export const runCommandTool: Tool<RunCommandInput> = {
                 });
             };
 
+            const onAbort = () => {
+                if (settled || aborted) return;
+                aborted = true;
+                if (proc.pid) killProcessGroup(proc.pid);
+                emitUpdate();
+            };
+
             const cleanup = () => {
                 if (timeoutHandle) clearTimeout(timeoutHandle);
                 clearInterval(heartbeatHandle);
+                options?.signal?.removeEventListener("abort", onAbort);
             };
 
             const settle = (exitCode: number | null, isError: boolean) => {
@@ -215,6 +229,12 @@ export const runCommandTool: Tool<RunCommandInput> = {
             }, HEARTBEAT_INTERVAL_MS);
             heartbeatHandle.unref?.();
 
+            if (options?.signal?.aborted) {
+                onAbort();
+            } else {
+                options?.signal?.addEventListener("abort", onAbort, { once: true });
+            }
+
             emitUpdate();
 
             proc.stdout?.on("data", (data) => {
@@ -239,6 +259,10 @@ export const runCommandTool: Tool<RunCommandInput> = {
 
             proc.on("close", (code, signal) => {
                 const elapsedSeconds = Math.max(0, (Date.now() - startedAt) / 1000).toFixed(1);
+                if (aborted) {
+                    settle(null, true);
+                    return;
+                }
                 if (timedOut) {
                     stderr = stderr.trimEnd();
                     stderr = `${stderr}${stderr ? "\n" : ""}Timed out after ${timeoutSeconds} seconds (${elapsedSeconds}s elapsed).`;

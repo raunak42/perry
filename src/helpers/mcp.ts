@@ -230,9 +230,9 @@ export class StdioMcpClient {
         return allTools;
     }
 
-    async callTool(name: string, args: Record<string, unknown>): Promise<{ output: string; isError: boolean; raw: unknown }> {
+    async callTool(name: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<{ output: string; isError: boolean; raw: unknown }> {
         await this.connect();
-        const result = await this.request("tools/call", { name, arguments: args });
+        const result = await this.request("tools/call", { name, arguments: args }, signal);
         const record = isRecord(result) ? result : {};
         const content = "content" in record ? record.content : result;
         const output = clipMcpOutput(formatMcpContent(content));
@@ -251,19 +251,38 @@ export class StdioMcpClient {
         this.initialized = false;
     }
 
-    private request(method: string, params?: unknown): Promise<unknown> {
+    private request(method: string, params?: unknown, signal?: AbortSignal): Promise<unknown> {
         if (!this.proc?.stdin.writable) {
             return Promise.reject(new Error(`MCP server '${this.serverName}' is not running.`));
         }
         const id = this.nextId++;
         const message: JsonRpcMessage = { jsonrpc: "2.0", id, method, params };
         return new Promise((resolve, reject) => {
-            const timer = setTimeout(() => {
+            let settled = false;
+            const finish = (callback: () => void) => {
+                if (settled) return;
+                settled = true;
                 this.pending.delete(id);
-                reject(new Error(`MCP request '${method}' to '${this.serverName}' timed out.`));
+                clearTimeout(timer);
+                signal?.removeEventListener("abort", onAbort);
+                callback();
+            };
+            const onAbort = () => finish(() => reject(new Error(`MCP request '${method}' to '${this.serverName}' process terminated.`)));
+            const timer = setTimeout(() => {
+                finish(() => reject(new Error(`MCP request '${method}' to '${this.serverName}' timed out.`)));
             }, this.requestTimeoutMs);
             timer.unref?.();
-            this.pending.set(id, { resolve, reject, timer });
+            if (signal?.aborted) {
+                clearTimeout(timer);
+                onAbort();
+                return;
+            }
+            this.pending.set(id, {
+                resolve: (value) => finish(() => resolve(value)),
+                reject: (error) => finish(() => reject(error)),
+                timer,
+            });
+            signal?.addEventListener("abort", onAbort, { once: true });
             this.proc?.stdin.write(`${JSON.stringify(message)}\n`);
         });
     }
@@ -361,7 +380,7 @@ export class McpManager {
         this.registeredTools = tools;
     }
 
-    async call(functionName: string, args: unknown): Promise<ToolExecutionResult<McpTraceDetails>> {
+    async call(functionName: string, args: unknown, signal?: AbortSignal): Promise<ToolExecutionResult<McpTraceDetails>> {
         const registered = this.registeredTools.find((tool) => tool.functionName === functionName);
         if (!registered) {
             return {
@@ -380,7 +399,7 @@ export class McpManager {
         }
         const toolArgs = isRecord(args) ? args : {};
         try {
-            const result = await client.callTool(registered.tool.name, toolArgs);
+            const result = await client.callTool(registered.tool.name, toolArgs, signal);
             return {
                 output: result.output || "MCP tool returned no output.",
                 modelOutput: result.output || "MCP tool returned no output.",
@@ -442,6 +461,6 @@ export function createMcpTools(manager: McpManager): Array<Tool<Record<string, u
             parameters: normalizeToolSchema(registered.tool.inputSchema),
             strict: false,
         } as OpenAI.Responses.FunctionTool,
-        execute: async (args) => manager.call(registered.functionName, args),
+        execute: async (args, options) => manager.call(registered.functionName, args, options?.signal),
     }));
 }

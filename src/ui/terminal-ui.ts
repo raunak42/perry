@@ -18,6 +18,7 @@ const RESIZE_SETTLE_DELAY_MS = 120;
 const STREAM_INPUT_REDRAW_DEBOUNCE_MS = 80;
 const TOOL_ELAPSED_REDRAW_INTERVAL_MS = 100;
 const PROMPT_BORDER_CHARS = { horizontal: "─" };
+const PROMPT_BORDER_COLOR = "#48d1cc";
 const CHOICE_HINT_TEXT = "↑/↓ move · Enter select · Ctrl+C cancel";
 const CHOICE_SELECTED_TEXT_STYLE: AnsiStyle = { fg: "#48d1cc", bold: true };
 const CHOICE_SELECTED_ROW_STYLE: AnsiStyle = { bg: "#1f1f1f" };
@@ -83,6 +84,7 @@ interface StreamingBlockState {
 type RetainedHistoryBlock =
     | { kind: "markdown"; message: string }
     | { kind: "warning"; message: string }
+    | { kind: "error"; message: string }
     | { kind: "user"; message: string }
     | { kind: "assistant"; message: string }
     | { kind: "thinking"; message: string }
@@ -139,6 +141,10 @@ export class TerminalUi implements InteractiveUi {
     private stdoutBatchBuffer = "";
     private readonly retainedHistory: RetainedHistoryBlock[] = [];
     private readonly toolTraceFinishedListeners = new Set<(trace: PersistableToolTrace) => void>();
+    private readonly escapeListeners = new Set<() => void>();
+    private globalEscapeHandlerAttached = false;
+    private globalEscapeWasPaused = true;
+    private lastEscapeTriggeredAt = 0;
     private replayingRetainedHistory = false;
     private resizeRedrawTimer: ReturnType<typeof setTimeout> | null = null;
     private resizeHandlerAttached = false;
@@ -299,6 +305,10 @@ export class TerminalUi implements InteractiveUi {
             };
 
             const onKeypress = (text: string, key: Keypress) => {
+                if (key.name === "escape") {
+                    this.triggerEscape();
+                    return;
+                }
                 if (key.name === "paste-start") {
                     bracketedPasteActive = true;
                     bracketedPasteBuffer = "";
@@ -469,6 +479,10 @@ export class TerminalUi implements InteractiveUi {
             };
 
             const onKeypress = (_text: string, key: Keypress) => {
+                if (key.name === "escape") {
+                    this.triggerEscape();
+                    return;
+                }
                 if (key.ctrl && key.name === "c") {
                     const interruptError = new Error("Interrupted");
                     interruptError.name = "UserInterruptError";
@@ -519,6 +533,15 @@ export class TerminalUi implements InteractiveUi {
         this.retainHistoryBlock({ kind: "warning", message: normalized });
         this.liveTailTrace = null;
         this.printDuringBusy(() => this.printBlock(this.renderWarningBlock(normalized), false));
+    }
+
+    writeError(message: string): void {
+        if (this.destroyed) return;
+        const normalized = this.normalizeNewlines(message);
+        if (normalized.trim().length === 0) return;
+        this.retainHistoryBlock({ kind: "error", message: normalized });
+        this.liveTailTrace = null;
+        this.printDuringBusy(() => this.printBlock(this.renderErrorBlock(normalized), false));
     }
 
     writeUser(message: string): void {
@@ -843,6 +866,12 @@ export class TerminalUi implements InteractiveUi {
         return () => this.toolTraceFinishedListeners.delete(listener);
     }
 
+    onEscape(listener: () => void): () => void {
+        this.attachGlobalEscapeHandler();
+        this.escapeListeners.add(listener);
+        return () => this.escapeListeners.delete(listener);
+    }
+
     expandTrace(reference: string): boolean {
         const trimmed = reference.trim();
         if (!trimmed) return false;
@@ -900,6 +929,19 @@ export class TerminalUi implements InteractiveUi {
         this.activeSessionReject(abortError);
     }
 
+    triggerEscape(): void {
+        if (this.destroyed) return;
+        const now = Date.now();
+        if (now - this.lastEscapeTriggeredAt < 50) return;
+        this.lastEscapeTriggeredAt = now;
+        for (const listener of [...this.escapeListeners]) {
+            listener();
+        }
+        const abortError = new Error("Process terminated.");
+        abortError.name = "AbortError";
+        this.activeSessionReject?.(abortError);
+    }
+
     destroy(): void {
         if (this.destroyed) return;
         this.destroyed = true;
@@ -912,6 +954,7 @@ export class TerminalUi implements InteractiveUi {
         this.clearActiveSessionRedrawTimer();
         this.clearResizeRedrawTimer();
         this.detachResizeHandler();
+        this.escapeListeners.clear();
         this.stopToolElapsedTimer();
         this.deferActiveSessionRedraws = false;
         if (this.activeSessionCleanup) {
@@ -919,6 +962,7 @@ export class TerminalUi implements InteractiveUi {
             this.activeSessionCleanup = null;
             cleanup();
         }
+        this.detachGlobalEscapeHandler();
         this.bottomArea.destroy();
     }
 
@@ -1275,6 +1319,9 @@ export class TerminalUi implements InteractiveUi {
                 return;
             case "warning":
                 this.printBlock(this.renderWarningBlock(block.message), false);
+                return;
+            case "error":
+                this.printBlock(this.renderErrorBlock(block.message), false);
                 return;
             case "user":
                 this.printBlock(this.renderUserBlock(block.message), false);
@@ -1663,6 +1710,30 @@ export class TerminalUi implements InteractiveUi {
         };
     }
 
+    private readonly globalEscapeKeypressHandler = (_text: string, key: Keypress): void => {
+        if (key.name === "escape") this.triggerEscape();
+    };
+
+    private attachGlobalEscapeHandler(): void {
+        if (this.globalEscapeHandlerAttached) return;
+        emitKeypressEvents(process.stdin);
+        const stdin = process.stdin;
+        this.globalEscapeWasPaused = typeof stdin.isPaused === "function" ? stdin.isPaused() : false;
+        if (stdin.isTTY) stdin.setRawMode(true);
+        stdin.resume();
+        stdin.on("keypress", this.globalEscapeKeypressHandler);
+        this.globalEscapeHandlerAttached = true;
+    }
+
+    private detachGlobalEscapeHandler(): void {
+        if (!this.globalEscapeHandlerAttached) return;
+        const stdin = process.stdin;
+        stdin.off("keypress", this.globalEscapeKeypressHandler);
+        if (stdin.isTTY) stdin.setRawMode(false);
+        if (this.globalEscapeWasPaused) stdin.pause();
+        this.globalEscapeHandlerAttached = false;
+    }
+
     private buildPromptFrame(params: {
         prompt: string;
         showPromptText: boolean;
@@ -1687,15 +1758,14 @@ export class TerminalUi implements InteractiveUi {
         }
         const promptLines = params.showPromptText ? this.wrapPlainTextWords(params.prompt, width) : [];
         lines.push(...promptLines);
-        const borderColor = this.getReasoningBorderColor(this.currentReasoningLevel);
-        lines.push(this.styleAnsi(PROMPT_BORDER_CHARS.horizontal.repeat(width), { fg: borderColor }));
+        lines.push(this.styleAnsi(PROMPT_BORDER_CHARS.horizontal.repeat(width), { fg: PROMPT_BORDER_COLOR }));
         const inputLayout = this.buildInputLayout(params.value, width, params.cursor);
         if (params.value.length === 0) {
             lines.push(this.styleAnsi(this.fitToWidth(params.placeholder, width), { fg: "#6b7280", dim: true }));
         } else {
             for (const line of inputLayout.lines) lines.push(line.padEnd(width, " "));
         }
-        lines.push(this.styleAnsi(PROMPT_BORDER_CHARS.horizontal.repeat(width), { fg: borderColor }));
+        lines.push(this.styleAnsi(PROMPT_BORDER_CHARS.horizontal.repeat(width), { fg: PROMPT_BORDER_COLOR }));
         const sessionDetailLines = this.renderSessionDetailLines(width);
         if (sessionDetailLines.length > 0) {
             lines.push(...sessionDetailLines);
@@ -2434,6 +2504,17 @@ export class TerminalUi implements InteractiveUi {
         return this.renderPanelBlock(lines, this.getOutputWidth(), theme);
     }
 
+    private renderErrorBlock(text: string): string {
+        const theme: AnsiStyle = { fg: "#fecaca", bg: "#2a1717" };
+        const titleTheme: AnsiStyle = { ...theme, fg: "#f87171", bold: true };
+        const renderedLines = this.renderMarkdownLines(text.trimEnd());
+        const lines = renderedLines.map((line, index) => ({
+            text: line,
+            style: index === 0 ? titleTheme : theme,
+        }));
+        return this.renderPanelBlock(lines, this.getOutputWidth(), theme);
+    }
+
     private renderPanelBlock(lines: Array<{ text: string; style?: AnsiStyle }>, width: number, fillStyle: AnsiStyle): string {
         return this.formatter.renderPanelBlock(lines, width, fillStyle);
     }
@@ -2514,9 +2595,9 @@ export class TerminalUi implements InteractiveUi {
 
     private renderStartupCardBlock(card: StartupCard, ansiPreview: string | null): string {
         const width = this.getOutputWidth();
-        const borderStyle: AnsiStyle = { fg: "#60a5fa", bold: true };
+        const borderStyle: AnsiStyle = { fg: PROMPT_BORDER_COLOR, bold: true };
         const titleStyle: AnsiStyle = { fg: "#ffffff", bold: true };
-        const metaStyle: AnsiStyle = { fg: "#bfdbfe" };
+        const metaStyle: AnsiStyle = { fg: "#d9fbf8" };
         const mutedStyle: AnsiStyle = { fg: "#93a4b8", dim: true };
         const innerWidth = Math.max(20, width - 4);
         const title = card.subtitle ? `${card.title} — ${card.subtitle}` : card.title;
@@ -2745,18 +2826,6 @@ export class TerminalUi implements InteractiveUi {
     }
 
     private readonly handleStdoutResize = (): void => this.scheduleResizeRedraw();
-
-    private getReasoningBorderColor(level: string): string {
-        switch (level) {
-            case "off": return "#525252";
-            case "minimal": return "#6b7280";
-            case "low": return "#22c55e";
-            case "medium": return "#eab308";
-            case "high": return "#f97316";
-            case "xhigh": return "#d946ef";
-            default: return "#a3a3a3";
-        }
-    }
 
     private getTracePanelWidth(): number { return this.getOutputWidth(); }
     private getTerminalWidth(): number {

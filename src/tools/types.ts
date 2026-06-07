@@ -12,6 +12,7 @@ export interface ToolExecutionResult<TDetails = unknown> {
 
 export interface ToolExecutionOptions<TDetails = unknown> {
     onUpdate?: (result: ToolExecutionResult<TDetails>) => void;
+    signal?: AbortSignal;
 }
 
 export interface Tool<TArgs = unknown, TDetails = unknown> {
