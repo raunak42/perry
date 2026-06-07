@@ -5,6 +5,8 @@ export interface TransientFrame {
     cursorRow: number;
     cursorCol: number;
     cursorVisible: boolean;
+    width?: number;
+    busyStatusRow?: number;
 }
 
 export interface BottomAreaOptions {
@@ -149,12 +151,19 @@ export class BottomArea {
         }
     }
 
-    withHiddenTransient<T>(operation: () => T): T {
+    forgetRenderedState(): void {
+        this.busyLineVisible = false;
+        this.busyLineGapRows = 0;
+        this.activeTransient = null;
+        this.transientVisible = false;
+    }
+
+    withHiddenTransient<T>(operation: () => T, options?: { restore?: boolean }): T {
         const hiddenFrame = this.hideTransient();
         try {
             return operation();
         } finally {
-            if (hiddenFrame && this.activeTransient === hiddenFrame && !this.transientVisible) {
+            if (options?.restore !== false && hiddenFrame && this.activeTransient === hiddenFrame && !this.transientVisible) {
                 // The operation may have changed block spacing or busy state.
                 // Rebuild the prompt/choice frame instead of restoring a stale
                 // snapshot, otherwise the next stream append can use the wrong
@@ -195,8 +204,11 @@ export class BottomArea {
         this.busySpinnerTimer = setInterval(() => {
             if (!this.busyMessage || !this.busySpinnerVisible) return;
             this.busySpinnerFrameIndex = (this.busySpinnerFrameIndex + 1) % SPINNER_FRAMES.length;
-            if (this.options.isInputActive()) this.options.requestInputRedraw();
-            else this.writeBusyLine();
+            if (this.options.isInputActive()) {
+                if (!this.updateTransientBusyStatusLine()) this.options.requestInputRedraw();
+                return;
+            }
+            this.writeBusyLine();
         }, 100);
     }
 
@@ -228,22 +240,84 @@ export class BottomArea {
     }
 
     private formatBusyLine(spinner: string): string {
-        const elapsed = this.busyStartedAt === null ? "" : ` · ${Math.max(0, Math.floor((Date.now() - this.busyStartedAt) / 1000))}s`;
+        const elapsed = this.busyStartedAt === null ? "" : ` · ${this.formatBusyElapsedDuration()}`;
         return `${spinner} ${this.busyMessage ?? "Working"}${elapsed}`;
+    }
+
+    private formatBusyElapsedDuration(): string {
+        const totalSeconds = this.getBusyElapsedSeconds();
+        const hours = Math.floor(totalSeconds / 3600);
+        const minutes = Math.floor((totalSeconds % 3600) / 60);
+        const seconds = totalSeconds % 60;
+        if (hours > 0) return `${hours}h ${minutes}m ${seconds}s`;
+        if (minutes > 0) return `${minutes}m ${seconds}s`;
+        return `${seconds}s`;
+    }
+
+    private getBusyElapsedSeconds(): number {
+        return this.busyStartedAt === null ? 0 : Math.max(0, Math.floor((Date.now() - this.busyStartedAt) / 1000));
+    }
+
+    private updateTransientBusyStatusLine(): boolean {
+        if (!this.activeTransient || !this.transientVisible || this.activeTransient.busyStatusRow === undefined) return false;
+        if (!this.busyMessage || !this.busySpinnerVisible) return false;
+        const lineIndex = this.activeTransient.busyStatusRow;
+        if (lineIndex < 0 || lineIndex >= this.activeTransient.lines.length) return false;
+        const spinner = SPINNER_FRAMES[this.busySpinnerFrameIndex] ?? SPINNER_FRAMES[0];
+        const width = this.getFrameWidth(this.activeTransient);
+        const line = this.options.formatter.styleAnsi(
+            this.options.formatter.fitToWidth(this.formatBusyLine(spinner), width),
+            { fg: "#a3a3a3", dim: true },
+        );
+        this.activeTransient.lines[lineIndex] = line;
+        this.rewriteTransientLine(this.activeTransient, lineIndex, line);
+        return true;
+    }
+
+    private rewriteTransientLine(frame: TransientFrame, lineIndex: number, line: string): void {
+        const targetScreenRowOffset = this.measureTransientRowsBeforeLine(frame, lineIndex);
+        const { cursorScreenRowOffset } = this.measureTransientFrame(frame);
+        const relativeRows = cursorScreenRowOffset - targetScreenRowOffset;
+        const safeWidth = this.getFrameWidth(frame);
+        const cursorCol = Math.max(0, frame.cursorCol % safeWidth);
+
+        this.options.write("\u001b[?25l");
+        this.options.write("\r");
+        if (relativeRows > 0) this.options.write(`\u001b[${relativeRows}A`);
+        else if (relativeRows < 0) this.options.write(`\u001b[${Math.abs(relativeRows)}B`);
+        this.options.write(`\r\u001b[2K${line}`);
+        this.options.write("\r");
+        if (relativeRows > 0) this.options.write(`\u001b[${relativeRows}B`);
+        else if (relativeRows < 0) this.options.write(`\u001b[${Math.abs(relativeRows)}A`);
+        if (cursorCol > 0) this.options.write(`\u001b[${cursorCol}C`);
+        if (frame.cursorVisible) this.options.write("\u001b[?25h");
+    }
+
+    private measureTransientRowsBeforeLine(frame: TransientFrame, lineIndex: number): number {
+        const width = this.getFrameWidth(frame);
+        let rows = 0;
+        for (let index = 0; index < lineIndex; index += 1) {
+            rows += this.options.formatter.measureWrappedLineRows(frame.lines[index] ?? "", width);
+        }
+        return rows;
     }
 
     private positionTransientCursor(frame: TransientFrame): void {
         const { totalScreenRows, cursorScreenRowOffset } = this.measureTransientFrame(frame);
         const rowsUpFromBottom = Math.max(0, totalScreenRows - 1 - cursorScreenRowOffset);
-        const safeWidth = Math.max(1, this.options.getWidth());
+        const safeWidth = this.getFrameWidth(frame);
         this.options.write("\r");
         if (rowsUpFromBottom > 0) this.options.write(`\u001b[${rowsUpFromBottom}A`);
         const col = Math.max(0, frame.cursorCol % safeWidth);
         if (col > 0) this.options.write(`\u001b[${col}C`);
     }
 
+    private getFrameWidth(frame: TransientFrame): number {
+        return Math.max(1, frame.width ?? this.options.getWidth());
+    }
+
     private measureTransientFrame(frame: TransientFrame): { totalScreenRows: number; cursorScreenRowOffset: number } {
-        const width = Math.max(1, this.options.getWidth());
+        const width = this.getFrameWidth(frame);
         let totalScreenRows = 0;
         let cursorScreenRowOffset = 0;
         for (let index = 0; index < frame.lines.length; index += 1) {
