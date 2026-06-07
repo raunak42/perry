@@ -278,8 +278,7 @@ export class BottomArea {
         const targetScreenRowOffset = this.measureTransientRowsBeforeLine(frame, lineIndex);
         const { cursorScreenRowOffset } = this.measureTransientFrame(frame);
         const relativeRows = cursorScreenRowOffset - targetScreenRowOffset;
-        const safeWidth = this.getFrameWidth(frame);
-        const cursorCol = Math.max(0, frame.cursorCol % safeWidth);
+        const cursorCol = this.getCursorPhysicalColumn(frame);
 
         this.options.write("\u001b[?25l");
         this.options.write("\r");
@@ -308,7 +307,7 @@ export class BottomArea {
         const safeWidth = this.getFrameWidth(frame);
         this.options.write("\r");
         if (rowsUpFromBottom > 0) this.options.write(`\u001b[${rowsUpFromBottom}A`);
-        const col = Math.max(0, frame.cursorCol % safeWidth);
+        const col = this.getCursorPhysicalColumn(frame);
         if (col > 0) this.options.write(`\u001b[${col}C`);
     }
 
@@ -325,7 +324,25 @@ export class BottomArea {
             if (index < frame.cursorRow) cursorScreenRowOffset += rows;
             totalScreenRows += rows;
         }
-        cursorScreenRowOffset += Math.floor(frame.cursorCol / width);
+        cursorScreenRowOffset += this.getCursorExtraRows(frame);
         return { totalScreenRows, cursorScreenRowOffset };
+    }
+
+    private getCursorPhysicalWidth(frame: TransientFrame): number {
+        // Transient frames render one column narrower than the real terminal so
+        // full-width background/border rows do not trip the terminal autowrap
+        // flag. The editable cursor, however, may legitimately sit one cell
+        // after a full safe-width input line. Measure cursor placement against
+        // the physical width so that end-of-line cursor does not appear on a
+        // phantom next row before the prompt frame has grown.
+        return Math.max(1, this.getFrameWidth(frame) + 1);
+    }
+
+    private getCursorPhysicalColumn(frame: TransientFrame): number {
+        return Math.max(0, frame.cursorCol % this.getCursorPhysicalWidth(frame));
+    }
+
+    private getCursorExtraRows(frame: TransientFrame): number {
+        return Math.floor(Math.max(0, frame.cursorCol) / this.getCursorPhysicalWidth(frame));
     }
 }

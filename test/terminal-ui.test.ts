@@ -33,7 +33,7 @@ function assertStreamingMergeDoesNotDropCommonChunks(ui: TerminalUi): void {
     assert.equal(text, expected);
 }
 
-function emulateTerminalFinalScreen(raw: string, columns: number): string {
+function emulateTerminalFinalState(raw: string, columns: number): { screen: string; cursorRow: number; cursorCol: number } {
     const rows: string[][] = [Array(columns).fill(" ")];
     let row = 0;
     let col = 0;
@@ -89,7 +89,11 @@ function emulateTerminalFinalScreen(raw: string, columns: number): string {
 
     const rendered = rows.map((line) => line.join("").trimEnd());
     while (rendered.length > 0 && rendered[rendered.length - 1] === "") rendered.pop();
-    return rendered.join("\n");
+    return { screen: rendered.join("\n"), cursorRow: row, cursorCol: col };
+}
+
+function emulateTerminalFinalScreen(raw: string, columns: number): string {
+    return emulateTerminalFinalState(raw, columns).screen;
 }
 
 function emulateTerminalScrollback(raw: string, columns: number, viewportRows: number): string {
@@ -397,6 +401,47 @@ async function assertPromptBracketedPastePreservesMultilineTextWithoutSubmitting
         emitPromptKey("", { name: "return" });
         assert.equal(await prompt, "first line\nsecond line\nthird line");
     });
+}
+
+async function assertPromptCursorDoesNotWrapBeforeInputFrameExpands(): Promise<void> {
+    const originalWrite = process.stdout.write.bind(process.stdout);
+    const columnsDescriptor = Object.getOwnPropertyDescriptor(process.stdout, "columns");
+    const rowsDescriptor = Object.getOwnPropertyDescriptor(process.stdout, "rows");
+    let raw = "";
+    let rawBeforeCleanup = "";
+    (process.stdout as unknown as { write: typeof process.stdout.write }).write = ((chunk: unknown, encoding?: unknown, callback?: unknown) => {
+        raw += Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk);
+        if (typeof encoding === "function") encoding();
+        if (typeof callback === "function") callback();
+        return true;
+    }) as typeof process.stdout.write;
+    Object.defineProperty(process.stdout, "columns", { value: 20, configurable: true });
+    Object.defineProperty(process.stdout, "rows", { value: 10, configurable: true });
+
+    const ui = await TerminalUi.create();
+    const prompt = ui.ask(">", { placeholder: "Type a message" }).catch(() => undefined);
+    try {
+        await wait(1);
+        emitPromptKey("x".repeat(19), {});
+        await wait(1);
+        rawBeforeCleanup = raw;
+        ui.cancelActiveInput();
+        await prompt;
+    } finally {
+        ui.destroy();
+        (process.stdout as unknown as { write: typeof process.stdout.write }).write = originalWrite as typeof process.stdout.write;
+        if (columnsDescriptor) Object.defineProperty(process.stdout, "columns", columnsDescriptor);
+        else delete (process.stdout as unknown as { columns?: number }).columns;
+        if (rowsDescriptor) Object.defineProperty(process.stdout, "rows", rowsDescriptor);
+        else delete (process.stdout as unknown as { rows?: number }).rows;
+    }
+
+    const state = emulateTerminalFinalState(rawBeforeCleanup, 20);
+    const lines = state.screen.split("\n");
+    const inputLineIndex = lines.findIndex((line) => line === "x".repeat(19));
+    assert.notEqual(inputLineIndex, -1, `input line missing.\n${state.screen}`);
+    assert.equal(state.cursorRow, inputLineIndex, `cursor moved below single-line input before frame expanded.\n${state.screen}`);
+    assert.equal(state.cursorCol, 19);
 }
 
 async function assertReadTraceUsesPiMonoStyleCard(): Promise<void> {
@@ -1327,6 +1372,7 @@ test("prompt Shift+Tab cycles reasoning level", assertPromptShiftTabCyclesReason
 test("prompt up/down navigates message history", assertPromptUpDownNavigatesHistory);
 test("prompt up moves within wrapped draft before history", assertPromptUpMovesWithinWrappedDraftBeforeHistory);
 test("prompt bracketed paste preserves multiline text without submitting", assertPromptBracketedPastePreservesMultilineTextWithoutSubmitting);
+test("prompt cursor does not wrap before input frame expands", assertPromptCursorDoesNotWrapBeforeInputFrameExpands);
 test("read trace uses pi-mono style card", assertReadTraceUsesPiMonoStyleCard);
 test("edit trace uses diff card without fence markers", assertEditTraceUsesDiffCardWithoutFenceMarkers);
 test("live edit trace hides huge arguments until diff is ready", assertEditTraceDoesNotRenderHugeArgumentsBeforeDiff);
