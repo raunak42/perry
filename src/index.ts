@@ -938,7 +938,7 @@ async function main(options: CliOptions = {}) {
                             continue;
                         }
 
-                        sessionManager = SessionManager.open(selectedPath, sessionDir, process.cwd());
+                        sessionManager = SessionManager.open(selectedPath, undefined, process.cwd());
                         replaceHistory(history, sessionManager.buildHistory());
                         applySessionState(sessionManager, state, ui);
                         sessionManager.appendState(getStateSnapshot(state));

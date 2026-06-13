@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "bun:test";
-import { SessionManager, resolveSessionPath } from "../src/helpers/sessionManager";
+import { SessionManager, getDefaultSessionDir, resolveSessionPath } from "../src/helpers/sessionManager";
 
 test("sessions flush only after an assistant response and can be resumed", async () => {
     const dir = mkdtempSync(join(tmpdir(), "perry-session-test-"));
@@ -40,6 +40,35 @@ test("sessions flush only after an assistant response and can be resumed", async
         assert.notEqual(resolved.type, "not_found");
     } finally {
         rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("session lookup stays inside the selected Perry home", async () => {
+    const installedHome = mkdtempSync(join(tmpdir(), "perry-installed-sessions-"));
+    const devHome = mkdtempSync(join(tmpdir(), "perry-dev-sessions-"));
+
+    try {
+        const cwd = process.cwd();
+        const installedSession = SessionManager.create(cwd, getDefaultSessionDir(cwd, installedHome));
+        installedSession.appendMessage({ role: "user", content: "Installed session." });
+        installedSession.appendMessage({ role: "assistant", content: "Installed reply." });
+
+        const devSession = SessionManager.create(cwd, getDefaultSessionDir(cwd, devHome));
+        devSession.appendMessage({ role: "user", content: "Dev session." });
+        devSession.appendMessage({ role: "assistant", content: "Dev reply." });
+
+        const installedSessions = await SessionManager.list(cwd, getDefaultSessionDir(cwd, installedHome));
+        const devSessions = await SessionManager.list(cwd, getDefaultSessionDir(cwd, devHome));
+        const allInstalledSessions = await SessionManager.listAll(undefined, installedHome);
+        const allDevSessions = await SessionManager.listAll(undefined, devHome);
+
+        assert.deepEqual(installedSessions.map((session) => session.firstMessage), ["Installed session."]);
+        assert.deepEqual(devSessions.map((session) => session.firstMessage), ["Dev session."]);
+        assert.deepEqual(allInstalledSessions.map((session) => session.firstMessage), ["Installed session."]);
+        assert.deepEqual(allDevSessions.map((session) => session.firstMessage), ["Dev session."]);
+    } finally {
+        rmSync(installedHome, { recursive: true, force: true });
+        rmSync(devHome, { recursive: true, force: true });
     }
 });
 

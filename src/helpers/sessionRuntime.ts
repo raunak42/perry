@@ -18,6 +18,7 @@ import { renderSessionTranscript } from "./renderSessionTranscript";
 import {
     formatSessionAge,
     formatSessionPath,
+    getSessionHomeDirFromSessionDir,
     resolveSessionPath,
     SessionManager,
     type PersistedProvider,
@@ -211,28 +212,59 @@ function formatSessionChoiceDescription(session: SessionInfo, scope: "current" |
     return parts.join(" · ");
 }
 
+export type ResumeScopeSelection = "current" | "all";
+
+function buildSessionOptions(sessions: SessionInfo[], scope: ResumeScopeSelection): Array<{ label: string; value: string; description: string }> {
+    return sessions.map((session) => ({
+        label: formatSessionChoiceLabel(session),
+        value: session.path,
+        description: `${scope} · ${formatSessionChoiceDescription(session, scope)}`,
+    }));
+}
+
 export async function chooseSessionPath(ui: InteractiveUi, cwd: string, sessionDir?: string): Promise<string | null> {
-    const [currentSessions, allSessions] = await withBusyIndicator(ui, "Loading sessions", () => Promise.all([
-        SessionManager.list(cwd, sessionDir),
-        SessionManager.listAll(),
+    const currentSessions = await withBusyIndicator(ui, "Loading sessions", () => SessionManager.list(cwd, sessionDir));
+    const currentOptions = buildSessionOptions(currentSessions, "current");
+
+    const showAllValue = "__show_all_sessions__";
+    const showAllOption = {
+        label: "Show all sessions",
+        value: showAllValue,
+        description: "Browse sessions from other repositories in this Perry state directory",
+    };
+
+    if (currentOptions.length > 0) {
+        const selected = await ui.choose("Resume session", [
+            ...currentOptions,
+            showAllOption,
+        ]);
+        if (selected !== showAllValue) return selected;
+    } else {
+        const selected = await ui.choose("Resume session", [
+            {
+                label: "No sessions for this repository",
+                value: "__none__",
+                description: "Choose Show all sessions to browse sessions from other repositories",
+            },
+            showAllOption,
+        ], showAllValue);
+        if (selected !== showAllValue) return null;
+    }
+
+    const sessionHomeDir = getSessionHomeDirFromSessionDir(sessionDir);
+    const [allSessions, localSessions] = await withBusyIndicator(ui, "Loading all sessions", () => Promise.all([
+        SessionManager.listAll(undefined, sessionHomeDir),
+        currentSessions.length > 0 ? Promise.resolve(currentSessions) : SessionManager.list(cwd, sessionDir),
     ]));
-    const seen = new Set(currentSessions.map((session) => session.path));
+    const seen = new Set(localSessions.map((session) => session.path));
     const globalSessions = allSessions.filter((session) => !seen.has(session.path));
-    const options = [
-        ...currentSessions.slice(0, 30).map((session) => ({
-            label: formatSessionChoiceLabel(session),
-            value: session.path,
-            description: `current · ${formatSessionChoiceDescription(session, "current")}`,
-        })),
-        ...globalSessions.slice(0, 20).map((session) => ({
-            label: formatSessionChoiceLabel(session),
-            value: session.path,
-            description: `all · ${formatSessionChoiceDescription(session, "all")}`,
-        })),
+    const allOptions = [
+        ...buildSessionOptions(localSessions, "current"),
+        ...buildSessionOptions(globalSessions, "all"),
     ];
 
-    if (options.length === 0) return null;
-    return ui.choose("Resume session", options);
+    if (allOptions.length === 0) return null;
+    return ui.choose("Resume session from all repositories", allOptions);
 }
 
 export async function createSessionManagerFromOptions(options: SessionCliOptions, cwd: string, ui: InteractiveUi): Promise<SessionManager> {
@@ -251,7 +283,7 @@ export async function createSessionManagerFromOptions(options: SessionCliOptions
         if (resolved.type === "global" && resolved.cwd && resolved.cwd !== cwd) {
             ui.write(`Session is from ${formatSessionPath(resolved.cwd)}. Resuming its messages in the current directory.`);
         }
-        return SessionManager.open(resolved.path, sessionDir, cwd);
+        return SessionManager.open(resolved.path, undefined, cwd);
     }
 
     if (options.resume) {
@@ -260,7 +292,7 @@ export async function createSessionManagerFromOptions(options: SessionCliOptions
             ui.write("No saved sessions found. Starting a new session.");
             return SessionManager.create(cwd, sessionDir);
         }
-        return SessionManager.open(selectedPath, sessionDir, cwd);
+        return SessionManager.open(selectedPath, undefined, cwd);
     }
 
     if (options.continue) {

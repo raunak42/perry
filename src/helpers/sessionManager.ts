@@ -118,8 +118,8 @@ function generateEntryId(existing: { has(id: string): boolean }): string {
     return randomUUID();
 }
 
-function getPerrySessionsRoot(): string {
-    return path.join(authDir, "sessions");
+function getPerrySessionsRoot(baseDir = authDir): string {
+    return path.join(baseDir, "sessions");
 }
 
 export function getDefaultSessionDir(cwd: string, baseDir = authDir): string {
@@ -127,6 +127,13 @@ export function getDefaultSessionDir(cwd: string, baseDir = authDir): string {
     const dir = path.join(baseDir, "sessions", safePath);
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
     return dir;
+}
+
+export function getSessionHomeDirFromSessionDir(sessionDir?: string): string | undefined {
+    if (!sessionDir) return undefined;
+    const parent = path.dirname(path.resolve(sessionDir));
+    if (path.basename(parent) !== "sessions") return undefined;
+    return path.dirname(parent);
 }
 
 export function parseSessionEntries(content: string): SessionFileEntry[] {
@@ -276,7 +283,7 @@ export async function resolveSessionPath(sessionArg: string, cwd: string, sessio
     const localMatch = localSessions.find((session) => session.id.startsWith(sessionArg));
     if (localMatch) return { type: "local", path: localMatch.path };
 
-    const allSessions = await SessionManager.listAll();
+    const allSessions = await SessionManager.listAll(undefined, getSessionHomeDirFromSessionDir(sessionDir));
     const globalMatch = allSessions.find((session) => session.id.startsWith(sessionArg));
     if (globalMatch) return { type: "global", path: globalMatch.path, cwd: globalMatch.cwd };
 
@@ -584,8 +591,8 @@ export class SessionManager {
         return sessions;
     }
 
-    static async listAll(onProgress?: SessionListProgress): Promise<SessionInfo[]> {
-        const root = getPerrySessionsRoot();
+    static async listAll(onProgress?: SessionListProgress, baseDir = authDir): Promise<SessionInfo[]> {
+        const root = getPerrySessionsRoot(baseDir);
         if (!existsSync(root)) return [];
         try {
             const dirs = (await readdir(root, { withFileTypes: true }))

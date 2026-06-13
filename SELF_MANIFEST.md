@@ -107,6 +107,7 @@ Keep this file accurate whenever Perry's user-visible behavior, slash commands, 
 - Source/dev Perry may copy legacy session files from `~/.perry/sessions` into `~/.perry-dev/sessions` to preserve resumability after the state-dir split, but it does not migrate legacy auth or preferences.
 - Perry persists completed tool traces, including reads, writes, edits, shell/tool calls, MCP calls, plan interactions, and subagent traces, so resumed sessions can replay trace cards in transcript order.
 - Perry supports `/resume`, `/continue`, and `/new` for local sessions.
+- `/resume` shows sessions for the current repository first and includes an explicit `Show all sessions` option before listing sessions from other repositories; installed and source/dev Perry session stores remain separate unless `PERRY_HOME` is explicitly shared.
 - Perry's prompt metadata shows context usage as used tokens / context window plus percent, e.g. `context [184k/400k · 46%]`; approximate estimates are prefixed with `~`.
 - Perry supports manual `/compact` and automatic context compaction, with loaders for slow operations.
 
