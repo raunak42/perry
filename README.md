@@ -55,6 +55,27 @@ Source/dev Perry already defaults to `~/.perry-dev`, separate from installed Per
 PERRY_HOME=~/.perry-dev-custom bun run dev
 ```
 
+## Releases
+
+CI runs on pushes and pull requests to `main`.
+
+Perry publishes through npm Trusted Publishing, so the GitHub Actions release workflow does not need an `NPM_TOKEN` secret. Configure the trusted publisher for `@perry-ai/cli` in npm with:
+
+- Owner: `raunak42`
+- Repository: `perry`
+- Workflow filename: `release.yml`
+- Environment: leave blank
+
+To publish a new npm release:
+
+```bash
+npm version patch
+# or: npm version minor / npm version major
+git push --follow-tags
+```
+
+Pushing a `v*.*.*` tag runs the release workflow, validates the package, and publishes to npm. The release workflow can also be started manually from GitHub Actions.
+
 ## Architecture Inspiration
 
 Inspired by [Geoffrey Huntley's agent architecture notes](https://ghuntley.com/agent/).
