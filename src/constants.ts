@@ -1,10 +1,10 @@
-import os from "node:os";
 import path from "node:path";
 import type { ProjectContextFile } from "./helpers/projectContext";
+import { getPerryHomePath } from "./helpers/packageInfo";
 import { formatSkillsManifestSection, type SkillDefinition } from "./helpers/skills";
 
-export const authDir = path.join(os.homedir(), ".perry");
-export const authPath = path.join(authDir, "auth.json");
+export const authDir = getPerryHomePath();
+export const authPath = getPerryHomePath("auth.json");
 
 export const oauthCallbackPort = 1455;
 export const oauthCallbackUrl = `http://localhost:${oauthCallbackPort}/auth/callback`;

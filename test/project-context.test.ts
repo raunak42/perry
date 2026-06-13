@@ -46,7 +46,7 @@ test("AGENTS.md wins over CLAUDE.md in the same directory", () => {
 
 test("default agent dir matches Perry auth layout", () => {
     assert.equal(path.basename(getDefaultAgentDir()), "agent");
-    assert.equal(path.basename(path.dirname(getDefaultAgentDir())), ".perry");
+    assert.equal(path.basename(path.dirname(getDefaultAgentDir())), ".perry-dev");
 });
 
 test("system prompt appends self manifest, skills, and project context before runtime metadata", () => {
@@ -88,11 +88,11 @@ test("project context paths are escaped in prompt tags", () => {
     assert.match(section, /path="\/repo\/A&amp;B&quot;&lt;\.md"/);
 });
 
-test("self manifest loads from the Perry repo root", () => {
+test("self manifest loads from the Perry package root", () => {
     const root = mkdtempSync(path.join(tmpdir(), "perry-self-manifest-"));
     writeFileSync(path.join(root, "SELF_MANIFEST.md"), "Perry self context");
 
-    const manifest = loadSelfManifest({ cwd: root });
+    const manifest = loadSelfManifest({ packageRoot: root });
 
     assert.equal(manifest?.path, path.join(root, "SELF_MANIFEST.md"));
     assert.equal(manifest?.content, "Perry self context");

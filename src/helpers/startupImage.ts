@@ -2,12 +2,13 @@ import { existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
+import { getPackageRoot } from "./packageInfo";
 import type { ProjectContextFile } from "./projectContext";
 import type { PermissionMode } from "./permissions";
 import type { SessionDetailLine, StartupCard } from "../ui/types";
 
-export const DEFAULT_STARTUP_IMAGE_PATH = "/home/raunak/Downloads/image (26).png";
-export const DEFAULT_STARTUP_ANSI_IMAGE_PATH = "/home/raunak/Downloads/better_duck_ansi_flat_equal_eyes.ans";
+export const DEFAULT_STARTUP_IMAGE_PATH = path.join(getPackageRoot(), "assets", "startup.png");
+export const DEFAULT_STARTUP_ANSI_IMAGE_PATH = path.join(getPackageRoot(), "assets", "startup.ans");
 
 export function getStartupImagePath(env: NodeJS.ProcessEnv = process.env): string | null {
     const configured = env.PERRY_STARTUP_IMAGE ?? env.PERRY_STARTUP_IMAGE_PATH;

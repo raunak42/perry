@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
+import path from "node:path";
 import { test } from "bun:test";
 import { createResponseDoneSoundCommand, getResponseDoneSoundPath } from "../src/helpers/responseDoneSound";
 
-test("response done sound uses formula 1 notification by default", () => {
-    assert.equal(getResponseDoneSoundPath({}), "/home/raunak/Downloads/formula-1-radio-notification.mp3");
+test("response done sound defaults to a packaged asset path when present", () => {
+    const soundPath = getResponseDoneSoundPath({});
+    assert.ok(soundPath === null || path.basename(soundPath) === "response-done.mp3");
 });
 
 test("response done sound can be disabled with env override", () => {

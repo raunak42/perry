@@ -1,11 +1,28 @@
 {
-  "name": "perry",
-  "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "name": "@perry-ai/cli",
+  "version": "0.1.3",
+  "description": "Terminal-native coding agent with tools, planning, MCP, skills, permissions, and subagents.",
+  "main": "dist/index.js",
+  "type": "commonjs",
+  "bin": {
+    "perry": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "assets/startup.png",
+    "assets/startup.ans",
+    "assets/response-done.mp3",
+    "SELF_MANIFEST.md",
+    "README.md",
+    "install.sh",
+    "package.json"
+  ],
   "scripts": {
     "test": "bun test ./test",
     "dev": "bun run ./src/index.ts",
+    "build": "node ./scripts/clean-dist.cjs && tsc -p tsconfig.build.json",
+    "prepack": "bun x tsc --noEmit && bun test && bun run build",
+    "pack:dry": "npm pack --dry-run",
     "test:terminal-ui": "bun test ./test/terminal-ui.test.ts",
     "test:formatting": "bun test ./test/terminal-formatting.test.ts",
     "test:sessions": "bun test ./test/session.test.ts",
@@ -13,11 +30,22 @@
     "test:image-read": "bun test ./test/image-read.test.ts",
     "test:compaction": "bun test ./test/compaction.test.ts"
   },
-  "keywords": [],
+  "keywords": [
+    "cli",
+    "coding-agent",
+    "agent",
+    "mcp",
+    "openai"
+  ],
   "author": "",
   "license": "ISC",
-  "type": "commonjs",
   "packageManager": "bun@1.3.13",
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "devDependencies": {
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
@@ -31,8 +59,5 @@
     "express": "^5.2.1",
     "open": "^11.0.0",
     "openai": "^6.34.0"
-  },
-  "bin": {
-    "perry": "./dist/index.js"
   }
 }

@@ -1,8 +1,9 @@
 import { spawn } from "child_process";
 import { existsSync } from "fs";
 import { join } from "path";
+import { getPackageRoot } from "./packageInfo";
 
-const DEFAULT_RESPONSE_DONE_SOUND_PATH = "/home/raunak/Downloads/formula-1-radio-notification.mp3";
+const DEFAULT_RESPONSE_DONE_SOUND_PATH = join(getPackageRoot(), "assets", "response-done.mp3");
 
 export type ResponseDoneSoundCommand = {
     command: string;
@@ -21,7 +22,7 @@ export function getResponseDoneSoundPath(env: NodeJS.ProcessEnv = process.env): 
         return trimmed;
     }
 
-    return DEFAULT_RESPONSE_DONE_SOUND_PATH;
+    return existsSync(DEFAULT_RESPONSE_DONE_SOUND_PATH) ? DEFAULT_RESPONSE_DONE_SOUND_PATH : null;
 }
 
 export function createResponseDoneSoundCommand(filePath: string, hasCommand: CommandProbe): ResponseDoneSoundCommand | null {

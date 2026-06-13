@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { authDir } from "../constants";
+import { getPackageRoot } from "./packageInfo";
 
 export type ProjectContextFile = {
     path: string;
@@ -35,9 +36,9 @@ export function loadContextFileFromDir(dir: string): ProjectContextFile | null {
 }
 
 export function loadSelfManifest(options: {
-    cwd?: string;
+    packageRoot?: string;
 } = {}): ProjectContextFile | null {
-    const manifestPath = path.join(path.resolve(options.cwd ?? process.cwd()), SELF_MANIFEST_FILENAME);
+    const manifestPath = path.join(path.resolve(options.packageRoot ?? getPackageRoot()), SELF_MANIFEST_FILENAME);
     if (!existsSync(manifestPath)) return null;
 
     try {

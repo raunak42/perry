@@ -66,7 +66,7 @@ Keep this file accurate whenever Perry's user-visible behavior, slash commands, 
 ## MCP support
 
 - Perry supports MCP v1 through stdio MCP servers.
-- Config is loaded from `~/.perry/mcp.json`, `.perry/mcp.json`, and `.mcp.json`.
+- Config is loaded from the Perry user home MCP config (`~/.perry-ai/mcp.json` for installed Perry, `~/.perry-dev/mcp.json` for source/dev Perry, or `$PERRY_HOME/mcp.json`) plus project `.perry/mcp.json` and `.mcp.json`.
 - Config shape uses `mcpServers`, with per-server `command`, optional `args`, optional `env`, optional `cwd`, and optional `disabled`.
 - Perry starts configured servers, initializes them, lists tools, and exposes those tools as function tools named like `mcp__server__tool`.
 - MCP calls are routed through Perry's permission system.
@@ -89,7 +89,7 @@ Keep this file accurate whenever Perry's user-visible behavior, slash commands, 
 ## Skills
 
 - Perry supports reusable workflow skills through `SKILL.md` files.
-- Skills are loaded from `~/.perry/skills/*/SKILL.md` and `.perry/skills/*/SKILL.md` in parent directories down to the current working directory.
+- Skills are loaded from the Perry user home skills directory (`~/.perry-ai/skills/*/SKILL.md` for installed Perry, `~/.perry-dev/skills/*/SKILL.md` for source/dev Perry, or `$PERRY_HOME/skills/*/SKILL.md`) and `.perry/skills/*/SKILL.md` in parent directories down to the current working directory.
 - Skill names are normalized from metadata or directory names; project skills override global skills with the same normalized name.
 - `SKILL.md` can include optional YAML-like frontmatter fields such as `name` and `description`.
 - Perry includes a compact manifest of available skills in the system/developer prompt, but only injects the full skill body when the user applies a skill with `/skill <name>`.
@@ -99,10 +99,12 @@ Keep this file accurate whenever Perry's user-visible behavior, slash commands, 
 
 ## Context and memory
 
-- Perry auto-loads project instruction files from `~/.perry/agent/AGENTS.md` or `CLAUDE.md`, then parent directories down to the current working directory.
+- Perry auto-loads project instruction files from the Perry user home agent directory (`~/.perry-ai/agent/...` for installed Perry, `~/.perry-dev/agent/...` for source/dev Perry, or `$PERRY_HOME/agent/...`), then parent directories down to the current working directory.
 - In the same directory, `AGENTS.md` takes priority over `CLAUDE.md`.
 - `--no-context-files` / `-nc` disables AGENTS/CLAUDE project-context loading, but this self manifest is built-in Perry context and should still load.
 - Perry stores local sessions unless disabled with `--no-session`.
+- Installed Perry user state defaults to `~/.perry-ai`; source/dev Perry defaults to `~/.perry-dev`, and `PERRY_HOME` can explicitly isolate or share auth, sessions, preferences, global MCP config, global skills, and global AGENTS/CLAUDE instructions.
+- Source/dev Perry may copy legacy session files from `~/.perry/sessions` into `~/.perry-dev/sessions` to preserve resumability after the state-dir split, but it does not migrate legacy auth or preferences.
 - Perry persists completed tool traces, including reads, writes, edits, shell/tool calls, MCP calls, plan interactions, and subagent traces, so resumed sessions can replay trace cards in transcript order.
 - Perry supports `/resume`, `/continue`, and `/new` for local sessions.
 - Perry's prompt metadata shows context usage as used tokens / context window plus percent, e.g. `context [184k/400k · 46%]`; approximate estimates are prefixed with `~`.
@@ -129,12 +131,14 @@ Keep this file accurate whenever Perry's user-visible behavior, slash commands, 
 - If the clipboard contains raw image bytes, Perry saves them under `/tmp/perry-clipboard-images` by default and inserts the generated path.
 - `PERRY_CLIPBOARD_IMAGE_DIR` can override the generated clipboard-image directory.
 
-## Startup and providers
+## Startup, packaging, and providers
 
 - Perry can use an OpenAI API key provider or a ChatGPT/Codex provider.
+- Perry is packaged as the scoped npm package `@perry-ai/cli` while installing a command binary named `perry`.
+- Installed Perry loads its bundled `SELF_MANIFEST.md` from the package installation, while project context files, project MCP config, and project skills are loaded from the user's current working directory tree.
 - The startup card shows session, provider/model, subagents mode/thinking, context, permissions, plan mode, current directory, and loaded context files, with a Perry-like teal border.
 - Perry saves the selected `/model` model and reasoning level per provider in its auth/preferences file, so future starts with that provider use the same model and thinking.
-- Startup image paths can be configured with Perry startup-image environment variables.
+- Startup image paths can be configured with Perry startup-image environment variables; the npm package includes a bundled ANSI startup image when available.
 
 ## Not implemented yet / planned areas
 

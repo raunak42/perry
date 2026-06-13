@@ -1,8 +1,8 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import os from "node:os";
 import type OpenAI from "openai";
+import { getPackageVersion, getPerryHomePath } from "./packageInfo";
 import type { McpTraceDetails } from "../tools/traceDetails";
 import type { Tool, ToolExecutionResult } from "../tools/types";
 
@@ -109,15 +109,15 @@ function readMcpConfigFile(filePath: string): McpLoadedConfig | null {
     return { path: filePath, servers };
 }
 
-export function getMcpConfigPaths(cwd = process.cwd(), homeDir = os.homedir()): string[] {
+export function getMcpConfigPaths(cwd = process.cwd(), homeDir = getPerryHomePath()): string[] {
     return [
-        path.join(homeDir, ".perry", "mcp.json"),
+        path.join(homeDir, "mcp.json"),
         path.join(cwd, ".perry", "mcp.json"),
         path.join(cwd, ".mcp.json"),
     ];
 }
 
-export function loadMcpConfig(cwd = process.cwd(), homeDir = os.homedir()): { files: McpLoadedConfig[]; servers: Record<string, McpServerConfig>; errors: McpConfigError[] } {
+export function loadMcpConfig(cwd = process.cwd(), homeDir = getPerryHomePath()): { files: McpLoadedConfig[]; servers: Record<string, McpServerConfig>; errors: McpConfigError[] } {
     const files: McpLoadedConfig[] = [];
     const servers: Record<string, McpServerConfig> = {};
     const errors: McpConfigError[] = [];
@@ -242,7 +242,7 @@ export class StdioMcpClient {
         await this.request("initialize", {
             protocolVersion: MCP_PROTOCOL_VERSION,
             capabilities: {},
-            clientInfo: { name: "perry", version: "1.0.0" },
+            clientInfo: { name: "perry", version: getPackageVersion() },
         });
         this.notify("notifications/initialized", {});
         this.initialized = true;
@@ -373,7 +373,7 @@ export class McpManager {
     private configErrors: McpConfigError[] = [];
     private serverStatuses = new Map<string, McpServerRuntimeStatus>();
 
-    constructor(private readonly cwd = process.cwd(), private readonly homeDir = os.homedir()) {}
+    constructor(private readonly cwd = process.cwd(), private readonly homeDir = getPerryHomePath()) {}
 
     get files(): string[] {
         return [...this.configFiles];
@@ -521,7 +521,7 @@ export class McpManager {
 
     describe(options: { verbose?: boolean; doctor?: boolean } = {}): string {
         if (this.configFiles.length === 0 && this.configErrors.length === 0) {
-            return "MCP: no config files found. Add ~/.perry/mcp.json, .perry/mcp.json, or .mcp.json.";
+            return "MCP: no config files found. Add $PERRY_HOME/mcp.json, the default Perry home mcp.json, .perry/mcp.json, or .mcp.json.";
         }
         const lines = [
             `MCP config: ${this.configFiles.length ? this.configFiles.join(", ") : "none loaded"}`,

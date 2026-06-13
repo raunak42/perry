@@ -1,6 +1,6 @@
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import os from "node:os";
 import path from "node:path";
+import { getPerryHomePath } from "./packageInfo";
 
 export type SkillSource = "global" | "project";
 
@@ -20,7 +20,7 @@ interface SkillMetadata {
     description?: string;
 }
 
-export function getDefaultSkillsDir(baseDir = path.join(os.homedir(), ".perry")): string {
+export function getDefaultSkillsDir(baseDir = getPerryHomePath()): string {
     return path.join(baseDir, "skills");
 }
 
@@ -207,7 +207,7 @@ export function formatSkillsList(skills: SkillDefinition[]): string {
     if (skills.length === 0) {
         return [
             "No skills found.",
-            "Add reusable workflows as SKILL.md files under ~/.perry/skills/<name>/ or .perry/skills/<name>/.",
+            "Add reusable workflows as SKILL.md files under $PERRY_HOME/skills/<name>/, the default Perry home skills directory, or .perry/skills/<name>/.",
         ].join("\n");
     }
 

@@ -7,12 +7,12 @@ import { createMcpFunctionName, loadMcpConfig, McpManager, sanitizeMcpToolNamePa
 
 test("loads MCP config from global and workspace files with workspace override", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "perry-mcp-test-"));
-    const home = path.join(root, "home");
+    const perryHome = path.join(root, "home", ".perry");
     const cwd = path.join(root, "repo");
-    fs.mkdirSync(path.join(home, ".perry"), { recursive: true });
+    fs.mkdirSync(perryHome, { recursive: true });
     fs.mkdirSync(path.join(cwd, ".perry"), { recursive: true });
 
-    fs.writeFileSync(path.join(home, ".perry", "mcp.json"), JSON.stringify({
+    fs.writeFileSync(path.join(perryHome, "mcp.json"), JSON.stringify({
         mcpServers: {
             docs: { command: "node", args: ["global.js"] },
             disabled: { command: "node", disabled: true },
@@ -24,7 +24,7 @@ test("loads MCP config from global and workspace files with workspace override",
         },
     }));
 
-    const loaded = loadMcpConfig(cwd, home);
+    const loaded = loadMcpConfig(cwd, perryHome);
 
     assert.equal(loaded.files.length, 2);
     assert.deepEqual(loaded.errors, []);
@@ -36,13 +36,13 @@ test("loads MCP config from global and workspace files with workspace override",
 
 test("reports invalid MCP config files without throwing", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "perry-mcp-invalid-"));
-    const home = path.join(root, "home");
+    const perryHome = path.join(root, "home", ".perry");
     const cwd = path.join(root, "repo");
-    fs.mkdirSync(path.join(home, ".perry"), { recursive: true });
+    fs.mkdirSync(perryHome, { recursive: true });
     fs.mkdirSync(cwd, { recursive: true });
-    fs.writeFileSync(path.join(home, ".perry", "mcp.json"), "{ nope");
+    fs.writeFileSync(path.join(perryHome, "mcp.json"), "{ nope");
 
-    const loaded = loadMcpConfig(cwd, home);
+    const loaded = loadMcpConfig(cwd, perryHome);
 
     assert.equal(loaded.files.length, 0);
     assert.equal(loaded.errors.length, 1);
@@ -61,7 +61,7 @@ test("sanitizes MCP function names and keeps them unique", () => {
 
 test("MCP manager keeps healthy servers when another server fails", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "perry-mcp-partial-"));
-    const home = path.join(root, "home");
+    const perryHome = path.join(root, "home", ".perry");
     const cwd = path.join(root, "repo");
     fs.mkdirSync(cwd, { recursive: true });
     fs.writeFileSync(path.join(cwd, ".mcp.json"), JSON.stringify({
@@ -90,7 +90,7 @@ process.stdin.on("data", (chunk) => {
         },
     }));
 
-    const manager = new McpManager(cwd, home);
+    const manager = new McpManager(cwd, perryHome);
     try {
         await manager.load();
         assert.equal(manager.tools.length, 1);

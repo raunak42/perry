@@ -1,17 +1,12 @@
 #!/usr/bin/env node
-import { execFileSync } from "node:child_process";
-import os from "node:os";
-import path from "node:path";
 import { Command } from "commander";
 import OpenAI from "openai";
 import { buildSystemPrompt } from "./constants";
 import { getCurrentSessionStatus } from "./helpers/getCurrentSessionStatus";
 import {
-    getContextConfig,
     getDefaultContextLevel,
     getDefaultModel,
     getDefaultReasoningLevel,
-    getModelDisplayMetadata,
     getReasoningConfig,
     getReasoningLevelsForModel,
     type ContextLevel,
@@ -41,19 +36,34 @@ import {
     type SkillDefinition,
 } from "./helpers/skills";
 import { normalizeCliArgv } from "./helpers/cliArgs";
+import { getPackageVersion } from "./helpers/packageInfo";
+import { formatLegacySessionMigrationMessage, migrateLegacyDevSessions } from "./helpers/legacyStateMigration";
 import { withBusyIndicator } from "./helpers/busyIndicator";
 import { getSlashCommandName, isSlashCommandInput } from "./helpers/commands";
-import { createMcpTools, McpManager } from "./helpers/mcp";
-import { getCodexResponse, ProviderLimitError, ProviderRequestError, type ParsedCodexResponse } from "./helpers/getCodexResponse";
+import { getApiKeyResponse } from "./helpers/apiKeyResponse";
+import { createFunctionCallTraceManager } from "./helpers/functionCallTraceManager";
 import {
-    formatSessionAge,
-    formatSessionPath,
-    resolveSessionPath,
-    SessionManager,
-    type SessionInfo,
-    type SessionStateSnapshot,
-} from "./helpers/sessionManager";
-import { renderSessionTranscript } from "./helpers/renderSessionTranscript";
+    createProviderNativeTraceManager as createExtractedProviderNativeTraceManager,
+    isFunctionCallItem as isExtractedFunctionCallItem,
+    isReasoningItem as isExtractedReasoningItem,
+} from "./helpers/providerNativeTraceManager";
+import { executeLocalToolCall } from "./helpers/localToolExecution";
+import { createPersistentPromptController } from "./helpers/persistentPromptController";
+import { createAssistantTextStreamer, createThinkingTraceStreamer } from "./helpers/streamingText";
+import { createMcpTools, McpManager } from "./helpers/mcp";
+import { getCodexResponse, type ParsedCodexResponse } from "./helpers/getCodexResponse";
+import { formatSessionPath, resolveSessionPath, SessionManager } from "./helpers/sessionManager";
+import {
+    applySessionState,
+    buildPromptSessionDetails,
+    chooseSessionPath,
+    createSessionManagerFromOptions,
+    describeSession,
+    getContextUsageSnapshot,
+    getStateSnapshot,
+    replaySessionTranscript,
+    replaceHistory,
+} from "./helpers/sessionRuntime";
 import { hasFunctionCallItems, shouldPersistAssistantResponseText, shouldRetainAssistantOutput } from "./helpers/assistantOutput";
 import { playResponseDoneSound } from "./helpers/responseDoneSound";
 import { buildStartupCard, getStartupAnsiImagePath, getStartupAnsiImageSize, getStartupImagePath } from "./helpers/startupImage";
@@ -61,14 +71,26 @@ import {
     buildCompactionSummary,
     buildHistorySummaryPrompt,
     buildTurnPrefixSummaryPrompt,
-    estimateContextTokens,
     getCompactionThreshold,
     prepareCompaction,
     SUMMARIZATION_SYSTEM_PROMPT,
     type CompactionResult,
 } from "./helpers/compaction";
-import { formatCompactTokenCount, formatContextUsageLine, type ContextUsageSnapshot } from "./helpers/contextUsage";
 import { extractThinkingTraces, formatThinkingTrace } from "./helpers/reasoning";
+import {
+    formatCompactCount,
+    formatProviderErrorMessage,
+    isAbortError,
+    shouldRenderProviderWarning,
+    throwIfAborted,
+    type RateLimitSnapshot,
+} from "./helpers/runtimeFormatting";
+import {
+    addResponseUsage,
+    createEmptyTurnUsageSnapshot,
+    snapshotTurnUsage,
+    type TurnUsageSnapshot,
+} from "./helpers/turnUsage";
 import { setOutputWriter } from "./ui/output";
 import { TerminalUi } from "./ui/terminal-ui";
 import { runCommandTool } from "./tools/runCommand";
@@ -81,29 +103,17 @@ import {
     createPlanModeInteractionTools,
     filterLocalToolsForPlanMode,
     filterProviderToolsForPlanMode,
-    getPlanModeBlockedCommandReason,
-    isLocalToolAllowedInPlanMode,
     isPlanApprovalInput,
     isPlanCompleteSelection,
     PLAN_COMPLETE_TOOL_NAME,
 } from "./helpers/planMode";
 import {
-    evaluateToolPermission,
     type PermissionEvaluation,
     type PermissionMode,
 } from "./helpers/permissions";
-import type { Response, ResponseCreateParamsNonStreaming, ResponseInputItem, ResponseOutputItem, ResponseStreamEvent, ResponseUsage } from "openai/resources/responses/responses";
+import type { Response, ResponseCreateParamsNonStreaming, ResponseInputItem } from "openai/resources/responses/responses";
+import type { SubagentTraceDetails } from "./tools/traceDetails";
 import type { Tool } from "./tools/types";
-import type {
-    CodeInterpreterTraceDetails,
-    FileSearchTraceDetails,
-    KnownToolTraceDetails,
-    LocalShellTraceDetails,
-    McpTraceDetails,
-    SubagentTraceDetails,
-    ToolSearchTraceDetails,
-    WebSearchTraceDetails,
-} from "./tools/traceDetails";
 import type { InteractiveUi, SessionDetailLine } from "./ui/types";
 
 
@@ -125,7 +135,7 @@ const program = new Command();
 program
     .name("perry")
     .description("A CLI coding agent")
-    .version("1.0.0")
+    .version(getPackageVersion())
     .option("-c, --continue", "Continue the most recent session for this directory")
     .option("-r, --resume", "Choose a previous session to resume")
     .option("--session <session>", "Resume a specific session file or session id prefix")
@@ -150,398 +160,6 @@ export interface State {
     pendingPlanExecution: boolean,
     subagentsMode: boolean,
     activeSkill: SkillDefinition | null,
-}
-
-type TurnUsageSnapshot = {
-    inputTokens: number;
-    cachedInputTokens: number;
-    outputTokens: number;
-    reasoningTokens: number;
-    totalTokens: number;
-};
-
-type RateLimitSnapshot = {
-    limitRequests?: number | null;
-    remainingRequests?: number | null;
-    resetRequests?: string | null;
-    limitTokens?: number | null;
-    remainingTokens?: number | null;
-    resetTokens?: string | null;
-};
-
-function createEmptyTurnUsageSnapshot(): TurnUsageSnapshot {
-    return {
-        inputTokens: 0,
-        cachedInputTokens: 0,
-        outputTokens: 0,
-        reasoningTokens: 0,
-        totalTokens: 0,
-    };
-}
-
-function addResponseUsage(target: TurnUsageSnapshot, usage?: ResponseUsage | null): void {
-    if (!usage) {
-        return;
-    }
-
-    target.inputTokens += usage.input_tokens;
-    target.cachedInputTokens += usage.input_tokens_details?.cached_tokens ?? 0;
-    target.outputTokens += usage.output_tokens;
-    target.reasoningTokens += usage.output_tokens_details?.reasoning_tokens ?? 0;
-    target.totalTokens += usage.total_tokens;
-}
-
-function snapshotTurnUsage(usage: TurnUsageSnapshot): TurnUsageSnapshot | null {
-    return usage.totalTokens > 0 ? { ...usage } : null;
-}
-
-function parseRateLimitNumber(raw: string | null): number | null {
-    if (!raw) {
-        return null;
-    }
-
-    const parsed = Number.parseInt(raw, 10);
-    return Number.isFinite(parsed) ? parsed : null;
-}
-
-function extractRateLimitSnapshot(headers: Headers): RateLimitSnapshot | null {
-    const snapshot: RateLimitSnapshot = {
-        limitRequests: parseRateLimitNumber(headers.get("x-ratelimit-limit-requests")),
-        remainingRequests: parseRateLimitNumber(headers.get("x-ratelimit-remaining-requests")),
-        resetRequests: headers.get("x-ratelimit-reset-requests"),
-        limitTokens: parseRateLimitNumber(headers.get("x-ratelimit-limit-tokens")),
-        remainingTokens: parseRateLimitNumber(headers.get("x-ratelimit-remaining-tokens")),
-        resetTokens: headers.get("x-ratelimit-reset-tokens"),
-    };
-
-    return Object.values(snapshot).some((value) => value !== null && value !== undefined)
-        ? snapshot
-        : null;
-}
-
-function shouldRenderProviderWarning(error: unknown): boolean {
-    if (error instanceof ProviderLimitError) return true;
-    const message = error instanceof Error ? error.message : String(error);
-    return /(?:\b429\b|too many requests|rate.?limit|usage.?limit|quota|limit.*reached)/i.test(message);
-}
-
-function isAbortError(error: unknown): boolean {
-    return error instanceof Error && (error.name === "AbortError" || /aborted|cancelled by escape|stopped by escape|process terminated/i.test(error.message));
-}
-
-function createAbortError(message = "Process terminated."): Error {
-    const error = new Error(message);
-    error.name = "AbortError";
-    return error;
-}
-
-function throwIfAborted(signal?: AbortSignal): void {
-    if (signal?.aborted) throw createAbortError();
-}
-
-function formatProviderErrorMessage(error: unknown): string {
-    if (isAbortError(error)) return "Process terminated.";
-
-    if (error instanceof ProviderLimitError) {
-        const details = error.details;
-        const resetText = formatLimitReset(details.resetsAt, details.resetsInSeconds);
-        return [
-            "Provider usage limit reached.",
-            details.message,
-            details.planType ? `Plan: ${details.planType}` : "",
-            resetText ? `Resets: ${resetText}` : "",
-            "You can wait for the reset, switch model/provider with /model or /login, or continue editing queued messages while Perry is idle.",
-        ].filter(Boolean).join("\n");
-    }
-
-    if (error instanceof ProviderRequestError) {
-        const body = error.body.trim();
-        const shortBody = body.length > 600 ? `${body.slice(0, 600).trimEnd()}…` : body;
-        return [`Provider request failed (${error.status}).`, shortBody].filter(Boolean).join("\n");
-    }
-
-    const message = error instanceof Error ? error.message : String(error);
-    if (/ECONNRESET|ETIMEDOUT|ENOTFOUND|network|fetch failed|503|502|504/i.test(message)) {
-        return `Provider/network error.\n${message}\nTry again in a moment, or switch providers/models if it persists.`;
-    }
-
-    return message;
-}
-
-function formatLimitReset(resetsAt?: number, resetsInSeconds?: number): string | null {
-    if (typeof resetsInSeconds === "number" && Number.isFinite(resetsInSeconds)) {
-        return formatDurationSeconds(Math.max(0, resetsInSeconds));
-    }
-    if (typeof resetsAt === "number" && Number.isFinite(resetsAt)) {
-        const milliseconds = resetsAt > 10_000_000_000 ? resetsAt - Date.now() : (resetsAt * 1000) - Date.now();
-        return formatDurationSeconds(Math.max(0, Math.ceil(milliseconds / 1000)));
-    }
-    return null;
-}
-
-function formatDurationSeconds(totalSeconds: number): string {
-    const days = Math.floor(totalSeconds / 86400);
-    const hours = Math.floor((totalSeconds % 86400) / 3600);
-    const minutes = Math.floor((totalSeconds % 3600) / 60);
-    if (days > 0) return `${days}d ${hours}h`;
-    if (hours > 0) return `${hours}h ${minutes}m`;
-    if (minutes > 0) return `${minutes}m`;
-    return `${totalSeconds}s`;
-}
-
-function formatCompactCount(value: number): string {
-    return formatCompactTokenCount(value);
-}
-
-function formatPercent(value: number): string {
-    return `${(value * 100).toFixed(value >= 0.1 ? 1 : 2)}%`;
-}
-
-function formatDuration(ms: number | null): string {
-    if (ms === null) {
-        return "—";
-    }
-
-    if (ms < 1_000) {
-        return `${ms}ms`;
-    }
-
-    const seconds = ms / 1_000;
-    if (seconds < 60) {
-        return `${seconds.toFixed(seconds >= 10 ? 1 : 2)}s`;
-    }
-
-    const minutes = Math.floor(seconds / 60);
-    const remainingSeconds = seconds % 60;
-    return `${minutes}m ${remainingSeconds.toFixed(remainingSeconds >= 10 ? 0 : 1)}s`;
-}
-
-function formatRepoPath(cwd: string): string {
-    const homeDir = os.homedir();
-    return cwd.startsWith(homeDir)
-        ? `~${cwd.slice(homeDir.length)}`
-        : cwd;
-}
-
-function getGitBranch(cwd: string): string | null {
-    try {
-        const branch = execFileSync("git", ["branch", "--show-current"], {
-            cwd,
-            encoding: "utf8",
-            stdio: ["ignore", "pipe", "ignore"],
-        }).trim();
-        return branch.length > 0 ? branch : null;
-    } catch {
-        return null;
-    }
-}
-
-async function getContextUsageSnapshot(
-    state: State,
-    history: ChatMessage[],
-    systemContext: ChatMessage,
-    openaiTools: any[],
-    signal?: AbortSignal,
-): Promise<ContextUsageSnapshot> {
-    const contextConfig = getContextConfig(state.currentModel, state.contextLevel, state.activeProvider);
-    const input = [systemContext, ...history];
-
-    if (state.activeProvider === "openai-api-key" && state.client) {
-        try {
-            const count = await state.client.responses.inputTokens.count({
-                model: state.currentModel,
-                input,
-                tools: openaiTools,
-                reasoning: getReasoningConfig(state.reasoningLevel),
-                truncation: contextConfig.truncation,
-            }, { signal });
-
-            return {
-                usedTokens: count.input_tokens,
-                approximate: false,
-            };
-        } catch {
-            return {
-                usedTokens: estimateContextTokens(input),
-                approximate: true,
-            };
-        }
-    }
-
-    if (state.activeProvider === "openai-codex") {
-        return {
-            usedTokens: estimateContextTokens(input),
-            approximate: true,
-        };
-    }
-
-    return {
-        usedTokens: null,
-        approximate: false,
-    };
-}
-
-async function buildPromptSessionDetails(
-    state: State,
-    _history: ChatMessage[],
-    systemContext: ChatMessage,
-    openaiTools: any[],
-    _lastTurnUsage: TurnUsageSnapshot | null,
-    _lastTurnElapsedMs: number | null,
-    _lastRateLimit: RateLimitSnapshot | null,
-    sessionManager: SessionManager,
-): Promise<SessionDetailLine[]> {
-    const cwd = process.cwd();
-    const repoPath = formatRepoPath(cwd);
-    const branch = getGitBranch(cwd);
-    const modelMeta = getModelDisplayMetadata(state.currentModel, state.activeProvider);
-    const contextHistory = sessionManager.buildContextHistory();
-    const contextUsage = await getContextUsageSnapshot(state, contextHistory, systemContext, filterProviderToolsForSubagentsMode(filterProviderToolsForPlanMode(openaiTools, state.planMode), state.subagentsMode));
-
-    const repoLine = branch ? `${repoPath} (${branch})` : repoPath;
-
-    const contextLine = formatContextUsageLine(contextUsage, modelMeta.contextWindow);
-
-    return [
-        {
-            left: repoLine,
-        },
-        {
-            left: contextLine,
-            right: `${state.currentModel} · ${state.reasoningLevel} · sub:${state.subagentReasoningLevel}${state.subagentsMode ? ":on" : ":off"} · ${state.permissionMode}${state.planMode ? " · plan" : ""}${state.activeSkill ? ` · skill:${state.activeSkill.name}` : ""}`,
-        },
-    ];
-}
-
-function getStateSnapshot(state: State): SessionStateSnapshot {
-    return {
-        provider: state.activeProvider,
-        model: state.currentModel,
-        reasoningLevel: state.reasoningLevel,
-        subagentReasoningLevel: state.subagentReasoningLevel,
-        contextLevel: state.contextLevel,
-        permissionMode: state.permissionMode,
-        subagentsMode: state.subagentsMode,
-    };
-}
-
-function applySessionState(sessionManager: SessionManager, state: State, ui: InteractiveUi): void {
-    const snapshot = sessionManager.getLatestState();
-    if (!snapshot) return;
-
-    if (snapshot.provider === state.activeProvider) {
-        state.currentModel = snapshot.model;
-        state.reasoningLevel = snapshot.reasoningLevel;
-        state.subagentReasoningLevel = snapshot.subagentReasoningLevel ?? DEFAULT_SUBAGENT_REASONING_LEVEL;
-        state.contextLevel = snapshot.contextLevel;
-        state.permissionMode = snapshot.permissionMode ?? "ask";
-        state.subagentsMode = snapshot.subagentsMode ?? false;
-        ui.setReasoningLevel(state.reasoningLevel);
-        return;
-    }
-
-    if (snapshot.provider && state.activeProvider && snapshot.provider !== state.activeProvider) {
-        ui.write(`Session used ${snapshot.provider}; current login is ${state.activeProvider}. Keeping current provider/model settings.`);
-    }
-}
-
-function replaceHistory(history: ChatMessage[], nextHistory: ChatMessage[]): void {
-    history.splice(0, history.length, ...nextHistory);
-}
-
-function truncateSessionText(text: string, maxLength: number): string {
-    const normalized = text.trim();
-    if (normalized.length <= maxLength) return normalized;
-    return `${normalized.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`;
-}
-
-function replaySessionTranscript(ui: InteractiveUi, sessionManager: SessionManager, _history: ChatMessage[]): void {
-    renderSessionTranscript(ui, sessionManager.getSessionId(), sessionManager.getEntries());
-}
-
-function formatSessionChoiceLabel(session: SessionInfo): string {
-    return truncateSessionText(session.firstMessage.replace(/\s+/g, " "), 72) || "(no messages)";
-}
-
-function formatSessionChoiceDescription(session: SessionInfo, scope: "current" | "all"): string {
-    const parts = [
-        session.id.slice(0, 8),
-        `${session.messageCount} ${session.messageCount === 1 ? "message" : "messages"}`,
-        formatSessionAge(session.modified),
-    ];
-    if (scope === "all") parts.push(formatSessionPath(session.cwd));
-    return parts.join(" · ");
-}
-
-async function chooseSessionPath(ui: InteractiveUi, cwd: string, sessionDir?: string): Promise<string | null> {
-    const [currentSessions, allSessions] = await withBusyIndicator(ui, "Loading sessions", () => Promise.all([
-        SessionManager.list(cwd, sessionDir),
-        SessionManager.listAll(),
-    ]));
-    const seen = new Set(currentSessions.map((session) => session.path));
-    const globalSessions = allSessions.filter((session) => !seen.has(session.path));
-    const options = [
-        ...currentSessions.slice(0, 30).map((session) => ({
-            label: formatSessionChoiceLabel(session),
-            value: session.path,
-            description: `current · ${formatSessionChoiceDescription(session, "current")}`,
-        })),
-        ...globalSessions.slice(0, 20).map((session) => ({
-            label: formatSessionChoiceLabel(session),
-            value: session.path,
-            description: `all · ${formatSessionChoiceDescription(session, "all")}`,
-        })),
-    ];
-
-    if (options.length === 0) return null;
-    return ui.choose("Resume session", options);
-}
-
-async function createSessionManagerFromOptions(options: CliOptions, cwd: string, ui: InteractiveUi): Promise<SessionManager> {
-    const sessionDir = options.sessionDir ? path.resolve(options.sessionDir) : undefined;
-
-    if (options.session === false) {
-        return SessionManager.inMemory(cwd);
-    }
-
-    if (typeof options.session === "string") {
-        const resolved = await withBusyIndicator(ui, "Resolving session", () => resolveSessionPath(options.session as string, cwd, sessionDir));
-        if (resolved.type === "not_found") {
-            ui.write(`No session found matching '${resolved.arg}'. Starting a new session.`);
-            return SessionManager.create(cwd, sessionDir);
-        }
-        if (resolved.type === "global" && resolved.cwd && resolved.cwd !== cwd) {
-            ui.write(`Session is from ${formatSessionPath(resolved.cwd)}. Resuming its messages in the current directory.`);
-        }
-        return SessionManager.open(resolved.path, sessionDir, cwd);
-    }
-
-    if (options.resume) {
-        const selectedPath = await chooseSessionPath(ui, cwd, sessionDir);
-        if (!selectedPath) {
-            ui.write("No saved sessions found. Starting a new session.");
-            return SessionManager.create(cwd, sessionDir);
-        }
-        return SessionManager.open(selectedPath, sessionDir, cwd);
-    }
-
-    if (options.continue) {
-        return SessionManager.continueRecent(cwd, sessionDir);
-    }
-
-    return SessionManager.create(cwd, sessionDir);
-}
-
-function describeSession(sessionManager: SessionManager, history: ChatMessage[]): string {
-    const file = sessionManager.getSessionFile();
-    const compactionCount = sessionManager.getCompactionCount();
-    return [
-        `Session ${sessionManager.getSessionId()}`,
-        `Messages: ${history.filter((message) => message.role === "user" || message.role === "assistant").length}`,
-        `Compactions: ${compactionCount}`,
-        `Storage: ${sessionManager.isPersisted() ? file ?? "pending first assistant response" : "disabled"}`,
-        `Directory: ${sessionManager.isPersisted() ? sessionManager.getSessionDir() : "—"}`,
-    ].join("\n");
 }
 
 async function runCompactionSummaryRequest(state: State, promptText: string, signal?: AbortSignal): Promise<string> {
@@ -669,1071 +287,6 @@ async function maybeAutoCompactSessionContext(
     });
 }
 
-function createStreamingTextBlockManager(ui: InteractiveUi, variant: "default" | "thinking") {
-    const blockIds = new Map<string, string>();
-    let streamed = false;
-
-    return {
-        get hasStreamedText(): boolean {
-            return streamed;
-        },
-        onStart(itemId: string): void {
-            if (blockIds.has(itemId)) {
-                return;
-            }
-
-            const blockId = ui.startStreamingBlock("", variant);
-            blockIds.set(itemId, blockId);
-        },
-        onDelta(itemId: string, delta: string): void {
-            let blockId = blockIds.get(itemId);
-            if (!blockId) {
-                this.onStart(itemId);
-                blockId = blockIds.get(itemId);
-            }
-
-            if (!blockId || delta.length === 0) {
-                return;
-            }
-
-            streamed = true;
-            ui.appendToStreamingBlock(blockId, delta);
-        },
-        onDone(itemId: string): void {
-            const blockId = blockIds.get(itemId);
-            if (!blockId) {
-                return;
-            }
-
-            ui.finishStreamingBlock(blockId);
-            blockIds.delete(itemId);
-        },
-        finishAll(): void {
-            for (const [itemId, blockId] of blockIds.entries()) {
-                ui.finishStreamingBlock(blockId);
-                blockIds.delete(itemId);
-            }
-        },
-    };
-}
-
-function createPersistentPromptController(
-    ui: TerminalUi,
-    onUserInterrupt: () => void,
-    options: {
-        getHistory?: () => string[];
-        onCycleReasoningLevel?: () => string | void;
-    } = {},
-) {
-    const pending: string[] = [];
-    const waiters: Array<{ resolve: (value: string) => void; reject: (error: Error) => void }> = [];
-    let stopped = false;
-    let paused = false;
-    let pauseResolver: (() => void) | null = null;
-    let pauseReadyResolver: (() => void) | null = null;
-    let pauseReadyPromise: Promise<void> | null = null;
-    let running = false;
-    let asking = false;
-
-    const markPauseReady = () => {
-        const resolve = pauseReadyResolver;
-        pauseReadyResolver = null;
-        resolve?.();
-    };
-
-    const updateQueuedDisplay = () => {
-        ui.setQueuedSteeringMessages(pending.filter((message) => !isSlashCommandInput(message)));
-    };
-
-    ui.setQueuedMessageEditHandler(() => {
-        const editable = pending.filter((message) => !isSlashCommandInput(message));
-        if (editable.length === 0) return "";
-        const deferredCommands = pending.filter((message) => isSlashCommandInput(message));
-        pending.splice(0, pending.length, ...deferredCommands);
-        updateQueuedDisplay();
-        return editable.join("\n\n");
-    });
-
-    const failWaiters = (error: Error) => {
-        for (const waiter of waiters.splice(0)) waiter.reject(error);
-    };
-
-    const enqueue = (value: string) => {
-        const waiter = waiters.shift();
-        if (waiter) waiter.resolve(value);
-        else {
-            pending.push(value);
-            updateQueuedDisplay();
-        }
-    };
-
-    const waitWhilePaused = async () => {
-        while (paused && !stopped) {
-            markPauseReady();
-            await new Promise<void>((resolve) => {
-                pauseResolver = resolve;
-            });
-        }
-    };
-
-    const run = async () => {
-        if (running) return;
-        running = true;
-        try {
-            while (!stopped) {
-                await waitWhilePaused();
-                if (stopped) break;
-                if (paused) continue;
-                try {
-                    asking = true;
-                    const answer = await ui.ask(">", {
-                        placeholder: "Type a message or a slash command",
-                        enableSlashCommands: true,
-                        history: () => {
-                            const submitted = options.getHistory?.() ?? [];
-                            const queued = pending.filter((message) => !isSlashCommandInput(message));
-                            return [...submitted, ...queued];
-                        },
-                        onCycleReasoningLevel: options.onCycleReasoningLevel,
-                    });
-                    asking = false;
-                    if (!stopped && answer.trim().length > 0) enqueue(answer);
-                } catch (error) {
-                    asking = false;
-                    if ((error as Error).name === "AbortError" && paused) {
-                        markPauseReady();
-                        await waitWhilePaused();
-                        continue;
-                    }
-                    if (stopped) break;
-                    if ((error as Error).name === "UserInterruptError") {
-                        stopped = true;
-                        failWaiters(error as Error);
-                        onUserInterrupt();
-                        break;
-                    }
-                    if ((error as Error).name !== "AbortError") throw error;
-                }
-            }
-        } finally {
-            running = false;
-        }
-    };
-
-    return {
-        start(): void {
-            void run();
-        },
-        async pause(): Promise<void> {
-            if (paused && pauseReadyPromise) {
-                await pauseReadyPromise;
-                return;
-            }
-            paused = true;
-            pauseReadyPromise = new Promise<void>((resolve) => {
-                pauseReadyResolver = resolve;
-            });
-            ui.cancelActiveInput();
-            if (!asking) markPauseReady();
-            await pauseReadyPromise;
-        },
-        resume(): void {
-            if (!paused) return;
-            paused = false;
-            pauseReadyPromise = null;
-            pauseReadyResolver = null;
-            const resolve = pauseResolver;
-            pauseResolver = null;
-            resolve?.();
-            void run();
-        },
-        stop(): void {
-            stopped = true;
-            paused = false;
-            pauseReadyResolver?.();
-            pauseReadyResolver = null;
-            pauseReadyPromise = null;
-            const resolve = pauseResolver;
-            pauseResolver = null;
-            resolve?.();
-            ui.cancelActiveInput();
-            ui.setQueuedMessageEditHandler(null);
-            ui.setQueuedSteeringMessages([]);
-        },
-        take(): Promise<string> {
-            const value = pending.shift();
-            updateQueuedDisplay();
-            if (value !== undefined) return Promise.resolve(value);
-            return new Promise((resolve, reject) => waiters.push({ resolve, reject }));
-        },
-        drain(): string[] {
-            const drained = pending.splice(0);
-            updateQueuedDisplay();
-            return drained;
-        },
-        pushFront(values: string[]): void {
-            pending.unshift(...values);
-            updateQueuedDisplay();
-        },
-    };
-}
-
-function createThinkingTraceStreamer(ui: InteractiveUi) {
-    const manager = createStreamingTextBlockManager(ui, "thinking");
-    return {
-        get hasStreamedThinking(): boolean {
-            return manager.hasStreamedText;
-        },
-        onStart(itemId: string): void {
-            manager.onStart(itemId);
-        },
-        onDelta(itemId: string, delta: string): void {
-            manager.onDelta(itemId, delta);
-        },
-        onDone(itemId: string): void {
-            manager.onDone(itemId);
-        },
-        finishAll(): void {
-            manager.finishAll();
-        },
-    };
-}
-
-function createAssistantTextStreamer(ui: InteractiveUi) {
-    let blockId: string | null = null;
-    let streamed = false;
-
-    return {
-        get hasStreamedText(): boolean {
-            return streamed;
-        },
-        onDelta(_itemId: string, delta: string): void {
-            if (delta.length === 0) return;
-            if (!blockId) blockId = ui.startStreamingBlock("", "default");
-            streamed = true;
-            ui.appendToStreamingBlock(blockId, delta);
-        },
-        onDone(_itemId: string): void {
-            // Keep one assistant block alive for the whole response. Some
-            // providers/proxies can emit multiple text item ids or premature
-            // done events; finishing per item creates repeated prefix blocks.
-        },
-        finishAll(retain = true): void {
-            if (!blockId) return;
-            ui.finishStreamingBlock(blockId, { retain });
-            blockId = null;
-        },
-    };
-}
-
-function yieldToEventLoop(): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, 0));
-}
-
-function isFunctionCallItem(item: ResponseOutputItem): item is Extract<ResponseOutputItem, { type: "function_call" }> {
-    return item.type === "function_call";
-}
-
-function isReasoningItem(item: ResponseOutputItem): item is Extract<ResponseOutputItem, { type: "reasoning" }> {
-    return item.type === "reasoning";
-}
-
-function isWebSearchItem(item: ResponseOutputItem): item is Extract<ResponseOutputItem, { type: "web_search_call" }> {
-    return item.type === "web_search_call";
-}
-
-function isFileSearchItem(item: ResponseOutputItem): item is Extract<ResponseOutputItem, { type: "file_search_call" }> {
-    return item.type === "file_search_call";
-}
-
-function isCodeInterpreterItem(item: ResponseOutputItem): item is Extract<ResponseOutputItem, { type: "code_interpreter_call" }> {
-    return item.type === "code_interpreter_call";
-}
-
-function isMcpCallItem(item: ResponseOutputItem): item is Extract<ResponseOutputItem, { type: "mcp_call" }> {
-    return item.type === "mcp_call";
-}
-
-function isMcpListToolsItem(item: ResponseOutputItem): item is Extract<ResponseOutputItem, { type: "mcp_list_tools" }> {
-    return item.type === "mcp_list_tools";
-}
-
-function isMcpApprovalRequestItem(item: ResponseOutputItem): item is Extract<ResponseOutputItem, { type: "mcp_approval_request" }> {
-    return item.type === "mcp_approval_request";
-}
-
-function isLocalShellCallItem(item: ResponseOutputItem): item is Extract<ResponseOutputItem, { type: "local_shell_call" }> {
-    return item.type === "local_shell_call";
-}
-
-function isLocalShellOutputItem(item: ResponseOutputItem): item is Extract<ResponseOutputItem, { type: "local_shell_call_output" }> {
-    return item.type === "local_shell_call_output";
-}
-
-function isToolSearchCallItem(item: ResponseOutputItem): item is Extract<ResponseOutputItem, { type: "tool_search_call" }> {
-    return item.type === "tool_search_call";
-}
-
-function isToolSearchOutputItem(item: ResponseOutputItem): item is Extract<ResponseOutputItem, { type: "tool_search_output" }> {
-    return item.type === "tool_search_output";
-}
-
-function formatToolExecutionError(error: unknown): string {
-    return error instanceof Error ? error.message : String(error);
-}
-
-function createFunctionCallTraceManager(ui: InteractiveUi) {
-    const itemIdsToCallIds = new Map<string, string>();
-    const itemIdsToNames = new Map<string, string>();
-    const argumentBuffers = new Map<string, string>();
-    const shownCallIds = new Set<string>();
-
-    const tryParseJson = (text: string): unknown | undefined => {
-        try {
-            return JSON.parse(text);
-        } catch {
-            return undefined;
-        }
-    };
-
-    const isShown = (callId: string): boolean => shownCallIds.has(callId);
-
-    return {
-        onOutputItemAdded(item: ResponseOutputItem): void {
-            if (!isFunctionCallItem(item)) {
-                return;
-            }
-
-            if (item.id) {
-                itemIdsToCallIds.set(item.id, item.call_id);
-                itemIdsToNames.set(item.id, item.name);
-            }
-
-            if (item.arguments && item.arguments.length > 0) {
-                argumentBuffers.set(item.call_id, item.arguments);
-            }
-        },
-        onResponseEvent(event: ResponseStreamEvent | { type: string; [key: string]: unknown }): void {
-            const responseEvent = event as any;
-
-            if (responseEvent.type === "response.function_call_arguments.delta") {
-                const callId = itemIdsToCallIds.get(responseEvent.item_id);
-                if (!callId) {
-                    return;
-                }
-
-                const toolName = itemIdsToNames.get(responseEvent.item_id) ?? "function_call";
-                const nextArguments = `${argumentBuffers.get(callId) ?? ""}${typeof responseEvent.delta === "string" ? responseEvent.delta : ""}`;
-                argumentBuffers.set(callId, nextArguments);
-                if (isShown(callId)) {
-                    ui.updateToolCallArguments(callId, nextArguments, tryParseJson(nextArguments));
-                }
-                return;
-            }
-
-            if (responseEvent.type === "response.function_call_arguments.done") {
-                const callId = itemIdsToCallIds.get(responseEvent.item_id) ?? responseEvent.item_id;
-                const toolName = itemIdsToNames.get(responseEvent.item_id) ?? (typeof responseEvent.name === "string" ? responseEvent.name : "function_call");
-                const finalArguments = typeof responseEvent.arguments === "string" ? responseEvent.arguments : "";
-                argumentBuffers.set(callId, finalArguments);
-                if (isShown(callId)) {
-                    ui.updateToolCallArguments(callId, finalArguments, tryParseJson(finalArguments));
-                }
-            }
-        },
-    };
-}
-
-function createProviderNativeTraceManager(ui: InteractiveUi) {
-    type ProviderTraceEntry = {
-        toolName: string;
-        args?: unknown;
-        output: string;
-        details?: KnownToolTraceDetails;
-    };
-
-    const traces = new Map<string, ProviderTraceEntry>();
-    const codeInterpreterCode = new Map<string, string>();
-    const mcpArguments = new Map<string, string>();
-
-    const ensureTrace = (
-        id: string,
-        toolName: string,
-        args: unknown,
-        status: "pending" | "running" | "complete" | "error" | "aborted",
-        output: string,
-        details?: KnownToolTraceDetails,
-    ): boolean => {
-        const existing = traces.get(id);
-        if (!existing) {
-            ui.showToolCall(id, toolName, args, status, output, details);
-            traces.set(id, {
-                toolName,
-                args,
-                output,
-                details,
-            });
-            return true;
-        }
-
-        if (args !== undefined) {
-            traces.set(id, {
-                ...existing,
-                args,
-            });
-        }
-
-        return false;
-    };
-
-    const setRunning = (id: string, toolName: string, args?: unknown, details?: KnownToolTraceDetails, output?: string) => {
-        const current = traces.get(id);
-        const nextEntry: ProviderTraceEntry = {
-            toolName,
-            args: args ?? current?.args,
-            output: output ?? current?.output ?? "",
-            details: details ?? current?.details,
-        };
-        const created = ensureTrace(id, toolName, nextEntry.args, "running", nextEntry.output, nextEntry.details);
-        traces.set(id, nextEntry);
-        if (!created) {
-            ui.updateToolExecution(id, nextEntry.output, false, nextEntry.details);
-        }
-    };
-
-    const setFinished = (
-        id: string,
-        toolName: string,
-        args?: unknown,
-        details?: KnownToolTraceDetails,
-        output?: string,
-        isError = false,
-    ) => {
-        const current = traces.get(id);
-        const nextEntry: ProviderTraceEntry = {
-            toolName,
-            args: args ?? current?.args,
-            output: output ?? current?.output ?? "",
-            details: details ?? current?.details,
-        };
-        const created = ensureTrace(id, toolName, nextEntry.args, isError ? "error" : "complete", nextEntry.output, nextEntry.details);
-        traces.set(id, nextEntry);
-        if (!created) {
-            ui.finishToolExecution(id, nextEntry.output, isError, nextEntry.details);
-        }
-    };
-
-    const withNote = (details: KnownToolTraceDetails | undefined, note: string): KnownToolTraceDetails | undefined => {
-        if (!details || !("note" in details)) {
-            return details;
-        }
-
-        return {
-            ...details,
-            note,
-        } as KnownToolTraceDetails;
-    };
-
-    const getTrace = (id: string): ProviderTraceEntry | undefined => traces.get(id);
-
-    const getWebSearchArgs = (item: Extract<ResponseOutputItem, { type: "web_search_call" }>): { action: string } | undefined => {
-        const action = (item as { action?: { type?: unknown } }).action;
-        return action && typeof action.type === "string"
-            ? { action: action.type }
-            : undefined;
-    };
-
-    const buildWebSearchDetails = (
-        item: Extract<ResponseOutputItem, { type: "web_search_call" }>,
-        note?: string,
-    ): WebSearchTraceDetails => {
-        const action = (item as { action?: any }).action;
-        if (!action || typeof action.type !== "string") {
-            return {
-                type: "web_search",
-                note,
-            };
-        }
-
-        if (action.type === "search") {
-            return {
-                type: "web_search",
-                actionType: "search",
-                queries: Array.isArray(action.queries)
-                    ? action.queries.filter((query: unknown): query is string => typeof query === "string")
-                    : typeof action.query === "string"
-                        ? [action.query]
-                        : [],
-                sources: Array.isArray(action.sources)
-                    ? action.sources
-                        .map((source: { url?: unknown }) => typeof source?.url === "string" ? source.url : null)
-                        .filter((url: string | null): url is string => url !== null)
-                    : [],
-                note,
-            };
-        }
-
-        if (action.type === "open_page") {
-            return {
-                type: "web_search",
-                actionType: "open_page",
-                url: typeof action.url === "string" ? action.url : undefined,
-                note,
-            };
-        }
-
-        return {
-            type: "web_search",
-            actionType: "find_in_page",
-            url: typeof action.url === "string" ? action.url : undefined,
-            pattern: typeof action.pattern === "string" ? action.pattern : undefined,
-            note,
-        };
-    };
-
-    const buildFileSearchDetails = (
-        item: Extract<ResponseOutputItem, { type: "file_search_call" }>,
-        note?: string,
-    ): FileSearchTraceDetails => ({
-        type: "file_search",
-        queries: item.queries,
-        results: item.results?.map((result) => ({
-            filename: result.filename,
-            score: result.score,
-            text: result.text,
-        })) ?? [],
-        note,
-    });
-
-    const buildCodeInterpreterDetails = (
-        item: Extract<ResponseOutputItem, { type: "code_interpreter_call" }>,
-        note?: string,
-    ): CodeInterpreterTraceDetails => ({
-        type: "code_interpreter",
-        code: codeInterpreterCode.get(item.id) ?? "",
-        outputs: item.outputs?.map((output) => output.type === "logs"
-            ? { type: "logs" as const, content: output.logs }
-            : { type: "image" as const, content: output.url }) ?? [],
-        note,
-    });
-
-    const buildMcpCallDetails = (
-        item: Extract<ResponseOutputItem, { type: "mcp_call" }>,
-        note?: string,
-    ): McpTraceDetails => ({
-        type: "mcp",
-        serverLabel: item.server_label,
-        toolName: item.name,
-        argumentsText: mcpArguments.get(item.id) ?? item.arguments,
-        output: item.output ?? undefined,
-        note,
-    });
-
-    const buildMcpListToolsDetails = (
-        item: Extract<ResponseOutputItem, { type: "mcp_list_tools" }>,
-        note?: string,
-    ): McpTraceDetails => ({
-        type: "mcp",
-        serverLabel: item.server_label,
-        tools: item.tools.map((tool) => ({
-            name: tool.name,
-            description: tool.description,
-        })),
-        note,
-    });
-
-    const buildMcpApprovalRequestDetails = (
-        item: Extract<ResponseOutputItem, { type: "mcp_approval_request" }>,
-        note?: string,
-    ): McpTraceDetails => ({
-        type: "mcp",
-        serverLabel: item.server_label,
-        toolName: item.name,
-        argumentsText: item.arguments,
-        note,
-    });
-
-    const buildLocalShellCallDetails = (
-        item: Extract<ResponseOutputItem, { type: "local_shell_call" }>,
-        note?: string,
-    ): LocalShellTraceDetails => ({
-        type: "local_shell",
-        command: item.action.command.join(" "),
-        workingDirectory: item.action.working_directory ?? undefined,
-        note,
-    });
-
-    const buildToolSearchCallDetails = (
-        item: Extract<ResponseOutputItem, { type: "tool_search_call" }>,
-        note?: string,
-    ): ToolSearchTraceDetails => ({
-        type: "tool_search",
-        argumentsText: (() => {
-            try {
-                return JSON.stringify(item.arguments, null, 2);
-            } catch {
-                return String(item.arguments);
-            }
-        })(),
-        note,
-    });
-
-    const buildToolSearchOutputDetails = (
-        item: Extract<ResponseOutputItem, { type: "tool_search_output" }>,
-        note?: string,
-    ): ToolSearchTraceDetails => ({
-        type: "tool_search",
-        tools: item.tools.map((tool) => ({
-            name: "name" in tool && typeof tool.name === "string" ? tool.name : item.type,
-            description: "description" in tool && typeof tool.description === "string" ? tool.description : null,
-            type: "type" in tool && typeof tool.type === "string" ? tool.type : null,
-        })),
-        note,
-    });
-
-    return {
-        onOutputItemAdded(item: ResponseOutputItem): void {
-            if (isWebSearchItem(item)) {
-                setRunning(item.id, "web_search", getWebSearchArgs(item), buildWebSearchDetails(item, "Searching the web..."));
-                return;
-            }
-
-            if (isFileSearchItem(item)) {
-                setRunning(item.id, "file_search", { queries: item.queries }, buildFileSearchDetails(item, "Searching files..."));
-                return;
-            }
-
-            if (isCodeInterpreterItem(item)) {
-                setRunning(item.id, "code_interpreter", undefined, buildCodeInterpreterDetails(item, "Preparing code interpreter..."));
-                return;
-            }
-
-            if (isMcpCallItem(item)) {
-                setRunning(item.id, "mcp", undefined, buildMcpCallDetails(item, "Calling MCP tool..."));
-                return;
-            }
-
-            if (isMcpListToolsItem(item)) {
-                setRunning(item.id, "mcp", undefined, buildMcpListToolsDetails(item, "Listing MCP tools..."));
-                return;
-            }
-
-            if (isMcpApprovalRequestItem(item)) {
-                setFinished(item.id, "mcp", undefined, buildMcpApprovalRequestDetails(item, "Approval required."));
-                return;
-            }
-
-            if (isLocalShellCallItem(item)) {
-                setRunning(item.id, "local_shell", undefined, buildLocalShellCallDetails(item, "Running shell command..."));
-                return;
-            }
-
-            if (isToolSearchCallItem(item)) {
-                setRunning(item.id, "tool_search", undefined, buildToolSearchCallDetails(item, "Searching for tools..."));
-            }
-        },
-        onOutputItemDone(item: ResponseOutputItem): void {
-            if (isWebSearchItem(item)) {
-                setFinished(item.id, "web_search", getWebSearchArgs(item), buildWebSearchDetails(item, "Web search completed."), undefined, item.status === "failed");
-                return;
-            }
-
-            if (isFileSearchItem(item)) {
-                setFinished(item.id, "file_search", { queries: item.queries }, buildFileSearchDetails(item, item.status === "failed" ? "File search failed." : "File search completed."), undefined, item.status === "failed" || item.status === "incomplete");
-                return;
-            }
-
-            if (isCodeInterpreterItem(item)) {
-                setFinished(item.id, "code_interpreter", undefined, buildCodeInterpreterDetails(item, item.status === "failed" ? "Code interpreter failed." : "Code interpreter completed."), undefined, item.status === "failed" || item.status === "incomplete");
-                return;
-            }
-
-            if (isMcpCallItem(item)) {
-                setFinished(item.id, "mcp", undefined, buildMcpCallDetails(item, item.status === "failed" ? "MCP call failed." : "MCP call completed."), item.output ?? undefined, item.status === "failed" || item.status === "incomplete");
-                return;
-            }
-
-            if (isMcpListToolsItem(item)) {
-                setFinished(item.id, "mcp", undefined, buildMcpListToolsDetails(item, item.error ? "Failed to list MCP tools." : "Listed MCP tools."), item.error ?? undefined, !!item.error);
-                return;
-            }
-
-            if (isMcpApprovalRequestItem(item)) {
-                setFinished(item.id, "mcp", undefined, buildMcpApprovalRequestDetails(item, "Approval required."));
-                return;
-            }
-
-            if (isLocalShellCallItem(item)) {
-                setFinished(item.id, "local_shell", undefined, buildLocalShellCallDetails(item, "Shell call completed."));
-                return;
-            }
-
-            if (isLocalShellOutputItem(item)) {
-                const existing = getTrace(item.id);
-                const details: LocalShellTraceDetails = existing?.details?.type === "local_shell"
-                    ? {
-                        ...existing.details,
-                        output: item.output,
-                        note: "Shell call completed.",
-                    }
-                    : {
-                        type: "local_shell",
-                        output: item.output,
-                        note: "Shell call completed.",
-                    };
-                setFinished(item.id, "local_shell", undefined, details, item.output);
-                return;
-            }
-
-            if (isToolSearchCallItem(item)) {
-                setFinished(item.id, "tool_search", undefined, buildToolSearchCallDetails(item, "Tool search completed."));
-                return;
-            }
-
-            if (isToolSearchOutputItem(item)) {
-                const traceId = item.call_id ?? item.id;
-                setFinished(traceId, "tool_search", undefined, buildToolSearchOutputDetails(item, "Tool search completed."));
-            }
-        },
-        onResponseEvent(event: ResponseStreamEvent | { type: string; [key: string]: unknown }): void {
-            const responseEvent = event as any;
-
-            switch (responseEvent.type) {
-                case "response.web_search_call.in_progress":
-                    setRunning(responseEvent.item_id, "web_search", undefined, withNote(getTrace(responseEvent.item_id)?.details, "Starting web search..."));
-                    return;
-                case "response.web_search_call.searching":
-                    setRunning(responseEvent.item_id, "web_search", undefined, withNote(getTrace(responseEvent.item_id)?.details, "Searching the web..."));
-                    return;
-                case "response.web_search_call.completed":
-                    setFinished(responseEvent.item_id, "web_search", undefined, withNote(getTrace(responseEvent.item_id)?.details, "Web search completed."));
-                    return;
-                case "response.file_search_call.in_progress":
-                    setRunning(responseEvent.item_id, "file_search", undefined, withNote(getTrace(responseEvent.item_id)?.details, "Starting file search..."));
-                    return;
-                case "response.file_search_call.searching":
-                    setRunning(responseEvent.item_id, "file_search", undefined, withNote(getTrace(responseEvent.item_id)?.details, "Searching files..."));
-                    return;
-                case "response.file_search_call.completed":
-                    setFinished(responseEvent.item_id, "file_search", undefined, withNote(getTrace(responseEvent.item_id)?.details, "File search completed."));
-                    return;
-                case "response.code_interpreter_call.in_progress":
-                    setRunning(responseEvent.item_id, "code_interpreter", undefined, withNote(getTrace(responseEvent.item_id)?.details, "Preparing code interpreter..."));
-                    return;
-                case "response.code_interpreter_call.interpreting":
-                    setRunning(responseEvent.item_id, "code_interpreter", undefined, withNote(getTrace(responseEvent.item_id)?.details, "Executing code..."));
-                    return;
-                case "response.code_interpreter_call.completed":
-                    setFinished(responseEvent.item_id, "code_interpreter", undefined, withNote(getTrace(responseEvent.item_id)?.details, "Code interpreter completed."));
-                    return;
-                case "response.code_interpreter_call_code.delta": {
-                    const nextCode = `${codeInterpreterCode.get(responseEvent.item_id) ?? ""}${typeof responseEvent.delta === "string" ? responseEvent.delta : ""}`;
-                    codeInterpreterCode.set(responseEvent.item_id, nextCode);
-                    const existing = getTrace(responseEvent.item_id)?.details;
-                    const details: CodeInterpreterTraceDetails = existing?.type === "code_interpreter"
-                        ? {
-                            ...existing,
-                            code: nextCode,
-                            note: "Generating code...",
-                        }
-                        : {
-                            type: "code_interpreter",
-                            code: nextCode,
-                            note: "Generating code...",
-                        };
-                    setRunning(responseEvent.item_id, "code_interpreter", undefined, details);
-                    return;
-                }
-                case "response.code_interpreter_call_code.done": {
-                    const finalCode = typeof responseEvent.code === "string" ? responseEvent.code : "";
-                    codeInterpreterCode.set(responseEvent.item_id, finalCode);
-                    const existing = getTrace(responseEvent.item_id)?.details;
-                    const details: CodeInterpreterTraceDetails = existing?.type === "code_interpreter"
-                        ? {
-                            ...existing,
-                            code: finalCode,
-                            note: "Executing code...",
-                        }
-                        : {
-                            type: "code_interpreter",
-                            code: finalCode,
-                            note: "Executing code...",
-                        };
-                    setRunning(responseEvent.item_id, "code_interpreter", undefined, details);
-                    return;
-                }
-                case "response.mcp_call.in_progress":
-                    setRunning(responseEvent.item_id, "mcp", undefined, withNote(getTrace(responseEvent.item_id)?.details, "Calling MCP tool..."));
-                    return;
-                case "response.mcp_call.completed":
-                    setFinished(responseEvent.item_id, "mcp", undefined, withNote(getTrace(responseEvent.item_id)?.details, "MCP call completed."));
-                    return;
-                case "response.mcp_call.failed":
-                    setFinished(responseEvent.item_id, "mcp", undefined, withNote(getTrace(responseEvent.item_id)?.details, "MCP call failed."), undefined, true);
-                    return;
-                case "response.mcp_call_arguments.delta": {
-                    const nextArguments = `${mcpArguments.get(responseEvent.item_id) ?? ""}${typeof responseEvent.delta === "string" ? responseEvent.delta : ""}`;
-                    mcpArguments.set(responseEvent.item_id, nextArguments);
-                    const existing = getTrace(responseEvent.item_id)?.details;
-                    const details: McpTraceDetails = existing?.type === "mcp"
-                        ? {
-                            ...existing,
-                            argumentsText: nextArguments,
-                            note: "Streaming MCP arguments...",
-                        }
-                        : {
-                            type: "mcp",
-                            argumentsText: nextArguments,
-                            note: "Streaming MCP arguments...",
-                        };
-                    setRunning(responseEvent.item_id, "mcp", undefined, details);
-                    return;
-                }
-                case "response.mcp_call_arguments.done": {
-                    const finalArguments = typeof responseEvent.arguments === "string" ? responseEvent.arguments : "";
-                    mcpArguments.set(responseEvent.item_id, finalArguments);
-                    const existing = getTrace(responseEvent.item_id)?.details;
-                    const details: McpTraceDetails = existing?.type === "mcp"
-                        ? {
-                            ...existing,
-                            argumentsText: finalArguments,
-                            note: "Calling MCP tool...",
-                        }
-                        : {
-                            type: "mcp",
-                            argumentsText: finalArguments,
-                            note: "Calling MCP tool...",
-                        };
-                    setRunning(responseEvent.item_id, "mcp", undefined, details);
-                    return;
-                }
-                case "response.mcp_list_tools.in_progress":
-                    setRunning(responseEvent.item_id, "mcp", undefined, withNote(getTrace(responseEvent.item_id)?.details, "Listing MCP tools..."));
-                    return;
-                case "response.mcp_list_tools.completed":
-                    setFinished(responseEvent.item_id, "mcp", undefined, withNote(getTrace(responseEvent.item_id)?.details, "Listed MCP tools."));
-                    return;
-                case "response.mcp_list_tools.failed":
-                    setFinished(responseEvent.item_id, "mcp", undefined, withNote(getTrace(responseEvent.item_id)?.details, "Failed to list MCP tools."), undefined, true);
-                    return;
-                default:
-                    return;
-            }
-        },
-    };
-}
-
-async function executeLocalToolCall(
-    toolCall: Extract<ResponseOutputItem, { type: "function_call" }>,
-    localTools: Array<Tool<any, any>>,
-    ui: InteractiveUi,
-    options: { planMode?: boolean; permissionMode?: PermissionMode; promptForPermission?: (evaluation: PermissionEvaluation) => Promise<boolean>; signal?: AbortSignal } = {},
-): Promise<{ output: string; modelOutput?: ResponseInputItem.FunctionCallOutput["output"]; isError: boolean; details?: unknown }> {
-    let args: unknown;
-
-    try {
-        throwIfAborted(options.signal);
-        args = JSON.parse(toolCall.arguments);
-    } catch (error) {
-        const message = `Invalid tool arguments for ${toolCall.name}: ${formatToolExecutionError(error)}`;
-        ui.showToolCall(toolCall.call_id, toolCall.name, undefined, "error", message);
-        ui.finishToolExecution(toolCall.call_id, message, true);
-        return {
-            output: message,
-            isError: true,
-        };
-    }
-
-    ui.showToolCall(toolCall.call_id, toolCall.name, args, "pending");
-    ui.startToolExecution(toolCall.call_id);
-
-    const tool = localTools.find((candidate) => candidate.name === toolCall.name);
-    if (!tool) {
-        const message = `Unknown local tool: ${toolCall.name}`;
-        ui.finishToolExecution(toolCall.call_id, message, true);
-        return {
-            output: message,
-            isError: true,
-        };
-    }
-
-    if (options.planMode && !isLocalToolAllowedInPlanMode(tool.name)) {
-        const message = `Blocked in plan mode: ${tool.name} is not allowed. Plan mode only permits read-only inspection tools.`;
-        ui.finishToolExecution(toolCall.call_id, message, true);
-        return {
-            output: message,
-            isError: true,
-        };
-    }
-
-    if (options.planMode && tool.name === "run_command") {
-        const command = args && typeof args === "object" && "command" in args
-            ? (args as { command?: unknown }).command
-            : undefined;
-        const blockedReason = typeof command === "string" ? getPlanModeBlockedCommandReason(command) : "missing shell command";
-        if (blockedReason) {
-            const message = `Blocked in plan mode: ${blockedReason}. Plan mode only permits read-only inspection commands.`;
-            ui.finishToolExecution(toolCall.call_id, message, true);
-            return {
-                output: message,
-                isError: true,
-            };
-        }
-    }
-
-    const permission = evaluateToolPermission({
-        mode: options.permissionMode ?? "ask",
-        toolName: tool.name,
-        args,
-        cwd: process.cwd(),
-        planMode: !!options.planMode,
-    });
-
-    if (permission.action === "deny") {
-        const message = `Blocked by permissions: ${permission.reason}.`;
-        ui.finishToolExecution(toolCall.call_id, message, true);
-        return {
-            output: message,
-            isError: true,
-        };
-    }
-
-    if (permission.action === "ask") {
-        const approved = await options.promptForPermission?.(permission);
-        if (!approved) {
-            const message = `Denied by user: ${permission.summary}.`;
-            ui.finishToolExecution(toolCall.call_id, message, true);
-            return {
-                output: message,
-                isError: true,
-            };
-        }
-    }
-
-    try {
-        throwIfAborted(options.signal);
-        const result = await tool.execute(args as never, {
-            signal: options.signal,
-            onUpdate: (update) => {
-                ui.updateToolExecution(toolCall.call_id, update.output, !!update.isError, update.details);
-            },
-        });
-        ui.finishToolExecution(toolCall.call_id, result.output, !!result.isError, result.details);
-        return {
-            output: result.output,
-            modelOutput: result.modelOutput as ResponseInputItem.FunctionCallOutput["output"] | undefined,
-            isError: !!result.isError,
-            details: result.details,
-        };
-    } catch (error) {
-        const message = isAbortError(error) ? "Process terminated." : formatToolExecutionError(error);
-        ui.finishToolExecution(toolCall.call_id, message, true);
-        return {
-            output: message,
-            isError: true,
-        };
-    }
-}
-
-async function getApiKeyResponse(
-    client: OpenAI,
-    agentInput: any[],
-    tools: any[],
-    model: string,
-    reasoningLevel: ReasoningLevel,
-    contextLevel: ContextLevel,
-    ui: InteractiveUi,
-    options: { streamOutput?: boolean; signal?: AbortSignal } = {},
-): Promise<{ response: Response; streamedThinking: boolean; streamedOutputText: boolean; rateLimit: RateLimitSnapshot | null }> {
-    const thinking = options.streamOutput === false ? null : createThinkingTraceStreamer(ui);
-    const outputText = options.streamOutput === false ? null : createAssistantTextStreamer(ui);
-    const functionCallTraces = createFunctionCallTraceManager(ui);
-    const providerTraces = createProviderNativeTraceManager(ui);
-    const contextConfig = getContextConfig(model, contextLevel, "openai-api-key");
-    const { data: stream, response: rawResponse } = await client.responses.create({
-        model,
-        input: agentInput,
-        tools,
-        reasoning: getReasoningConfig(reasoningLevel),
-        truncation: contextConfig.truncation,
-        context_management: contextConfig.context_management,
-        include: [
-            "web_search_call.action.sources",
-            "file_search_call.results",
-            "code_interpreter_call.outputs",
-        ],
-        store: false,
-        stream: true,
-    }, { signal: options.signal }).withResponse();
-
-    let finalResponse: Response | null = null;
-    let retainAssistantStream = true;
-    const rateLimit = extractRateLimitSnapshot(rawResponse.headers);
-
-    try {
-        for await (const event of stream) {
-            providerTraces.onResponseEvent(event);
-
-            if (event.type === "response.output_item.added") {
-                functionCallTraces.onOutputItemAdded(event.item);
-                providerTraces.onOutputItemAdded(event.item);
-            }
-
-            if (event.type === "response.output_item.done") {
-                providerTraces.onOutputItemDone(event.item);
-            }
-
-            functionCallTraces.onResponseEvent(event);
-
-            if (event.type === "response.output_item.added" && event.item.type === "reasoning") {
-                thinking?.onStart(event.item.id);
-            }
-
-            if (
-                (event.type === "response.reasoning_summary_text.delta" || event.type === "response.reasoning_text.delta") &&
-                "delta" in event &&
-                typeof event.delta === "string"
-            ) {
-                thinking?.onDelta(event.item_id, event.delta);
-                if (thinking) await yieldToEventLoop();
-            }
-
-            if (event.type === "response.reasoning_summary_text.done" || event.type === "response.reasoning_text.done") {
-                thinking?.onDone(event.item_id);
-            }
-
-            if (event.type === "response.output_text.delta" && typeof event.delta === "string") {
-                outputText?.onDelta(event.item_id, event.delta);
-                if (outputText) await yieldToEventLoop();
-            }
-
-            if (event.type === "response.output_text.done") {
-                outputText?.onDone(event.item_id);
-            }
-
-            if (event.type === "response.completed") {
-                finalResponse = event.response as Response;
-            }
-        }
-
-        if (!finalResponse) {
-            throw new Error("No final response received from OpenAI stream.");
-        }
-
-        retainAssistantStream = shouldRetainAssistantOutput(finalResponse.output);
-
-        return {
-            response: finalResponse,
-            streamedThinking: thinking?.hasStreamedThinking ?? false,
-            streamedOutputText: outputText?.hasStreamedText ?? false,
-            rateLimit,
-        };
-    } finally {
-        thinking?.finishAll();
-        outputText?.finishAll(retainAssistantStream);
-    }
-}
-
 async function runSubagentLoop(params: {
     state: State;
     baseInstructions: string;
@@ -1848,8 +401,8 @@ async function runSubagentLoop(params: {
 
         const responseText = aiResponse.output_text.trim();
         if (responseText) finalOutput = responseText;
-        const toolCalls = aiResponse.output.filter(isFunctionCallItem);
-        const assistantContextItems = aiResponse.output.filter((item) => !isReasoningItem(item));
+        const toolCalls = aiResponse.output.filter(isExtractedFunctionCallItem);
+        const assistantContextItems = aiResponse.output.filter((item) => !isExtractedReasoningItem(item));
 
         if (toolCalls.length === 0) {
             const output = finalOutput || "Subagent completed without a text report.";
@@ -1924,7 +477,8 @@ async function main(options: CliOptions = {}) {
     });
 
     const history: ChatMessage[] = [];
-    const selfManifest = loadSelfManifest({ cwd: process.cwd() });
+    const legacySessionMigration = migrateLegacyDevSessions();
+    const selfManifest = loadSelfManifest();
     const projectContextFiles = options.contextFiles === false ? [] : loadProjectContextFiles({ cwd: process.cwd() });
     let skills = loadSkillDefinitions({ cwd: process.cwd() });
     const buildBaseSystemContext = (): ChatMessage => ({
@@ -2025,6 +579,8 @@ async function main(options: CliOptions = {}) {
     await withBusyIndicator(ui, "Checking session status", () => getCurrentSessionStatus(state));
 
     let sessionManager = await createSessionManagerFromOptions(options, process.cwd(), ui);
+    const legacySessionMigrationMessage = formatLegacySessionMigrationMessage(legacySessionMigration);
+    if (legacySessionMigrationMessage) ui.writeWarning(legacySessionMigrationMessage);
     const unsubscribeToolTracePersistence = ui.onToolTraceFinished?.((trace) => {
         if (sessionManager.isPersisted()) sessionManager.appendToolTrace({
             ...trace,
@@ -2058,7 +614,7 @@ async function main(options: CliOptions = {}) {
         contextFiles: projectContextFiles,
     }));
     if (history.length > 0 || options.resume || options.continue || typeof options.session === "string") {
-        replaySessionTranscript(ui, sessionManager, history);
+        replaySessionTranscript(ui, sessionManager);
     }
 
     ui.setReasoningLevel(state.reasoningLevel);
@@ -2355,7 +911,7 @@ async function main(options: CliOptions = {}) {
                         replaceHistory(history, sessionManager.buildHistory());
                         applySessionState(sessionManager, state, ui);
                         sessionManager.appendState(getStateSnapshot(state));
-                        replaySessionTranscript(ui, sessionManager, history);
+                        replaySessionTranscript(ui, sessionManager);
                         continue;
                     }
 
@@ -2386,7 +942,7 @@ async function main(options: CliOptions = {}) {
                         replaceHistory(history, sessionManager.buildHistory());
                         applySessionState(sessionManager, state, ui);
                         sessionManager.appendState(getStateSnapshot(state));
-                        replaySessionTranscript(ui, sessionManager, history);
+                        replaySessionTranscript(ui, sessionManager);
                         continue;
                     }
 
@@ -2517,7 +1073,7 @@ async function main(options: CliOptions = {}) {
                         const thinking = createThinkingTraceStreamer(ui);
                         const outputText = createAssistantTextStreamer(ui);
                         const functionCallTraces = createFunctionCallTraceManager(ui);
-                        const providerTraces = createProviderNativeTraceManager(ui);
+                        const providerTraces = createExtractedProviderNativeTraceManager(ui);
                         let retainAssistantStream = true;
                         try {
                             aiResponse = await getCodexResponse({
@@ -2559,9 +1115,9 @@ async function main(options: CliOptions = {}) {
 
                     const responseText = aiResponse.output_text;
                     const thinkingTraces = extractThinkingTraces(aiResponse.output);
-                    const toolCalls = aiResponse.output.filter(isFunctionCallItem);
+                    const toolCalls = aiResponse.output.filter(isExtractedFunctionCallItem);
                     const hasToolCalls = hasFunctionCallItems(aiResponse.output);
-                    const assistantContextItems = aiResponse.output.filter((item) => !isReasoningItem(item));
+                    const assistantContextItems = aiResponse.output.filter((item) => !isExtractedReasoningItem(item));
                     let wroteFallbackThinking = false;
                     const wroteFallbackResponseText = Boolean(responseText) && !streamedOutputText && !hasToolCalls;
 

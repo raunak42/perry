@@ -1,5 +1,4 @@
 import { emitKeypressEvents } from "node:readline";
-import { readFileSync } from "node:fs";
 import { filterSlashCommands, type SlashCommandDefinition } from "../helpers/commands";
 import type { KnownToolTraceDetails } from "../tools/traceDetails";
 import {
@@ -9,6 +8,9 @@ import {
 } from "./traceFormatting";
 import { BottomArea, type TransientFrame } from "./bottom-area";
 import { TerminalFormatter, type AnsiStyle } from "./terminal-formatting";
+import { CHOICE_HINT_TEXT, renderChoiceOptionsWindow } from "./choice-rendering";
+import { readStartupAnsiPreview, renderStartupCardBlock } from "./startup-card-rendering";
+import { getStreamingDelta, getStreamingDisplayText, mergeStreamingText } from "./streaming-rendering";
 import { openImageExternally } from "../helpers/externalImageViewer";
 import { renderTerminalImage } from "../helpers/inlineImage";
 import { formatClipboardPathForPrompt, pasteClipboardImageAsTempFile } from "../helpers/clipboardImage";
@@ -19,12 +21,6 @@ const STREAM_INPUT_REDRAW_DEBOUNCE_MS = 80;
 const TOOL_ELAPSED_REDRAW_INTERVAL_MS = 100;
 const PROMPT_BORDER_CHARS = { horizontal: "─" };
 const PROMPT_BORDER_COLOR = "#48d1cc";
-const CHOICE_HINT_TEXT = "↑/↓ move · Enter select · Ctrl+C cancel";
-const CHOICE_SELECTED_TEXT_STYLE: AnsiStyle = { fg: "#48d1cc", bold: true };
-const CHOICE_SELECTED_ROW_STYLE: AnsiStyle = { bg: "#1f1f1f" };
-const CHOICE_OPTION_HORIZONTAL_PADDING = 1;
-const CHOICE_OPTION_VERTICAL_PADDING_ROWS = 0;
-const CHOICE_MAX_VISIBLE_OPTIONS = 10;
 const READ_TRACE_PREVIEW_LINES = 20;
 const READ_TRACE_EXPANDED_LINES = 160;
 const WRITE_TRACE_PREVIEW_LINES = 20;
@@ -585,8 +581,8 @@ export class TerminalUi implements InteractiveUi {
             })
             : null;
         if (!renderedImage && card.imagePath) openImageExternally(card.imagePath);
-        const ansiPreview = !renderedImage ? this.readStartupAnsiPreview(card.ansiImagePath) : null;
-        const renderedText = this.renderStartupCardBlock(card, ansiPreview);
+        const ansiPreview = !renderedImage ? readStartupAnsiPreview(card.ansiImagePath) : null;
+        const renderedText = renderStartupCardBlock(card, ansiPreview, this.getOutputWidth(), this.formatter);
 
         this.printDuringBusy(() => {
             this.printBlock(renderedText, false);
@@ -629,7 +625,7 @@ export class TerminalUi implements InteractiveUi {
         if (!block) return;
 
         const previousRawText = block.rawText;
-        block.rawText = this.mergeStreamingText(previousRawText, this.normalizeNewlines(text));
+        block.rawText = mergeStreamingText(previousRawText, this.normalizeNewlines(text));
         if (!block.started) {
             block.rawText = block.rawText.replace(/^\s+/, "");
             if (block.rawText.trim().length === 0) {
@@ -637,8 +633,8 @@ export class TerminalUi implements InteractiveUi {
                 return;
             }
         }
-        const displayRawText = this.getStreamingDisplayText(block);
-        const delta = this.getStreamingDelta(block.emittedText, displayRawText);
+        const displayRawText = getStreamingDisplayText(block.rawText, block.variant);
+        const delta = getStreamingDelta(block.emittedText, displayRawText);
         if (!delta) return;
         if (!block.started && this.hasUnstableInlineMarkdown(displayRawText)) return;
 
@@ -1342,8 +1338,8 @@ export class TerminalUi implements InteractiveUi {
                         name: block.card.imagePath.split(/[\\/]/).pop() ?? "perry-startup-image",
                     })
                     : null;
-                const ansiPreview = !renderedImage ? this.readStartupAnsiPreview(block.card.ansiImagePath) : null;
-                this.printBlock(this.renderStartupCardBlock(block.card, ansiPreview), false);
+                const ansiPreview = !renderedImage ? readStartupAnsiPreview(block.card.ansiImagePath) : null;
+                this.printBlock(renderStartupCardBlock(block.card, ansiPreview, this.getOutputWidth(), this.formatter), false);
                 if (renderedImage) {
                     this.beginBlock();
                     this.writeStdout(`${renderedImage.data}\n`);
@@ -1370,7 +1366,7 @@ export class TerminalUi implements InteractiveUi {
 
     private replayLiveStreamingBlocksAfterResize(): void {
         for (const block of this.streamingBlocks.values()) {
-            const displayText = this.getStreamingDisplayText(block);
+            const displayText = getStreamingDisplayText(block.rawText, block.variant);
             if (displayText.trim().length === 0) continue;
             const rendered = this.renderStreamingBlock(block, displayText);
             const rows = this.measureRenderedRows(rendered);
@@ -1773,18 +1769,11 @@ export class TerminalUi implements InteractiveUi {
                 lines.push("");
             }
         }
-        const visibleSuggestions = this.getVisibleChoiceWindow(params.suggestions, params.selectedSuggestionIndex);
-        for (let visibleIndex = visibleSuggestions.start; visibleIndex < visibleSuggestions.end; visibleIndex += 1) {
-            const suggestion = params.suggestions[visibleIndex]!;
-            lines.push(...this.renderChoiceOptionLines({
-                label: suggestion.name,
-                value: suggestion.name,
-                description: suggestion.description,
-            }, visibleIndex === params.selectedSuggestionIndex, width));
-        }
-        if (params.suggestions.length > CHOICE_MAX_VISIBLE_OPTIONS) {
-            lines.push(this.renderChoicePositionIndicator(params.selectedSuggestionIndex, params.suggestions.length, width));
-        }
+        lines.push(...renderChoiceOptionsWindow(params.suggestions.map((suggestion) => ({
+            label: suggestion.name,
+            value: suggestion.name,
+            description: suggestion.description,
+        })), params.selectedSuggestionIndex, width, this.formatter));
         return {
             lines: this.needsBlockSeparator ? ["", ...lines] : lines,
             cursorRow: (this.needsBlockSeparator ? 1 : 0) + queuedLines.length + (queuedLines.length > 0 ? 1 : 0) + (busyStatus ? 2 : 0) + promptLines.length + 1 + inputLayout.cursorRow,
@@ -1861,14 +1850,7 @@ export class TerminalUi implements InteractiveUi {
         lines.push(...this.wrapPlainTextWords(prompt, width).map((line) => this.styleAnsi(line, { fg: "#d4d4d4" })));
         lines.push(this.styleAnsi(CHOICE_HINT_TEXT, { fg: "#7b8088", dim: true }));
         lines.push("");
-        const visibleOptions = this.getVisibleChoiceWindow(options, selectedIndex);
-        for (let visibleIndex = visibleOptions.start; visibleIndex < visibleOptions.end; visibleIndex += 1) {
-            const option = options[visibleIndex]!;
-            lines.push(...this.renderChoiceOptionLines(option, visibleIndex === selectedIndex, width));
-        }
-        if (options.length > CHOICE_MAX_VISIBLE_OPTIONS) {
-            lines.push(this.renderChoicePositionIndicator(selectedIndex, options.length, width));
-        }
+        lines.push(...renderChoiceOptionsWindow(options, selectedIndex, width, this.formatter));
         return {
             lines: this.needsBlockSeparator ? ["", ...lines] : lines,
             cursorRow: (this.needsBlockSeparator ? 1 : 0) + Math.max(0, lines.length - 1),
@@ -1876,110 +1858,6 @@ export class TerminalUi implements InteractiveUi {
             cursorVisible: false,
             width,
         };
-    }
-
-    private getVisibleChoiceWindow<T>(options: readonly T[], selectedIndex: number): { start: number; end: number } {
-        if (options.length <= CHOICE_MAX_VISIBLE_OPTIONS) return { start: 0, end: options.length };
-        const maxStart = Math.max(0, options.length - CHOICE_MAX_VISIBLE_OPTIONS);
-        const halfWindow = Math.floor(CHOICE_MAX_VISIBLE_OPTIONS / 2);
-        const start = Math.min(maxStart, Math.max(0, selectedIndex - halfWindow));
-        return { start, end: Math.min(options.length, start + CHOICE_MAX_VISIBLE_OPTIONS) };
-    }
-
-    private renderChoicePositionIndicator(selectedIndex: number, total: number, width: number): string {
-        const label = `(${Math.min(total, Math.max(0, selectedIndex) + 1)}/${total})`;
-        return this.styleAnsi(this.fitToWidth(label, width), { fg: "#8aa9c8", dim: true });
-    }
-
-    private renderChoiceOptionLines<T>(option: ChoiceOption<T>, selected: boolean, width: number): string[] {
-        const horizontalPadding = Math.min(CHOICE_OPTION_HORIZONTAL_PADDING, Math.max(0, Math.floor((width - 1) / 2)));
-        const innerWidth = Math.max(1, width - horizontalPadding * 2);
-        const marker = selected ? "›" : " ";
-        const firstPrefix = `${marker} `;
-        const continuationPrefix = "  ";
-        const descriptionPrefix = "    ";
-        const firstWidth = Math.max(1, innerWidth - this.getVisibleTextWidth(firstPrefix));
-        const descriptionWidth = Math.max(1, innerWidth - this.getVisibleTextWidth(descriptionPrefix));
-        const contentLines: string[] = [];
-        const description = option.description?.trim();
-
-        const canRenderInlineDescription = (() => {
-            if (!description) return false;
-            const inlineGap = 3;
-            const descriptionVisibleWidth = this.getVisibleTextWidth(description);
-            const labelVisibleWidth = this.getVisibleTextWidth(option.label);
-            return descriptionVisibleWidth > 0
-                && labelVisibleWidth > 0
-                && labelVisibleWidth + inlineGap + descriptionVisibleWidth <= firstWidth;
-        })();
-
-        if (description && canRenderInlineDescription) {
-            const inlineGap = 3;
-            const descriptionVisibleWidth = this.getVisibleTextWidth(description);
-            const labelWidth = Math.max(1, firstWidth - descriptionVisibleWidth - inlineGap);
-            const labelLines = this.wrapPlainTextWords(option.label, labelWidth);
-            const firstLabelLine = labelLines[0] ?? "";
-            const paddedLabel = this.getVisibleTextWidth(firstLabelLine) >= labelWidth ? firstLabelLine : `${firstLabelLine}${" ".repeat(labelWidth - this.getVisibleTextWidth(firstLabelLine))}`;
-            const firstLine = `${firstPrefix}${paddedLabel}${" ".repeat(inlineGap)}${description}`;
-            contentLines.push(selected
-                ? this.styleAnsi(firstLine, CHOICE_SELECTED_TEXT_STYLE)
-                : `${this.styleAnsi(`${firstPrefix}${paddedLabel}${" ".repeat(inlineGap)}`, { fg: "#d4d4d4" })}${this.styleAnsi(description, { fg: "#8f969d", dim: true })}`);
-
-            for (const labelLine of labelLines.slice(1)) {
-                const text = `${continuationPrefix}${labelLine}`;
-                contentLines.push(selected
-                    ? this.styleAnsi(text, CHOICE_SELECTED_TEXT_STYLE)
-                    : this.styleAnsi(text, { fg: "#d4d4d4" }));
-            }
-
-            return this.renderChoiceOptionComponent(contentLines, selected, width, horizontalPadding);
-        }
-
-        const labelLines = this.wrapPlainTextWords(option.label, firstWidth);
-        for (let index = 0; index < labelLines.length; index += 1) {
-            const prefix = index === 0 ? firstPrefix : continuationPrefix;
-            const content = index === 0 ? labelLines[0] ?? "" : labelLines[index] ?? "";
-            const text = `${prefix}${content}`;
-            contentLines.push(selected
-                ? this.styleAnsi(text, CHOICE_SELECTED_TEXT_STYLE)
-                : this.styleAnsi(text, { fg: "#d4d4d4" }));
-        }
-
-        if (description) {
-            const descriptionLines = this.wrapPlainTextWords(description, descriptionWidth);
-            for (const descriptionLine of descriptionLines) {
-                const text = `${descriptionPrefix}${descriptionLine}`;
-                contentLines.push(selected
-                    ? this.styleAnsi(text, CHOICE_SELECTED_TEXT_STYLE)
-                    : this.styleAnsi(text, { fg: "#8f969d", dim: true }));
-            }
-        }
-
-        return this.renderChoiceOptionComponent(contentLines, selected, width, horizontalPadding);
-    }
-
-    private renderChoiceOptionComponent(contentLines: string[], selected: boolean, width: number, horizontalPadding: number): string[] {
-        const lines: string[] = [];
-        const paddingLine = selected ? this.styleAnsi(" ".repeat(width), CHOICE_SELECTED_ROW_STYLE) : "";
-        for (let index = 0; index < CHOICE_OPTION_VERTICAL_PADDING_ROWS; index += 1) {
-            lines.push(paddingLine);
-        }
-        for (const contentLine of contentLines.length > 0 ? contentLines : [""]) {
-            const indented = `${" ".repeat(horizontalPadding)}${contentLine}`;
-            lines.push(selected
-                ? this.renderSelectedChoiceLine(indented, width)
-                : indented);
-        }
-        for (let index = 0; index < CHOICE_OPTION_VERTICAL_PADDING_ROWS; index += 1) {
-            lines.push(paddingLine);
-        }
-        return lines;
-    }
-
-    private renderSelectedChoiceLine(content: string, width: number): string {
-        const visible = this.getVisibleTextWidth(content);
-        const padded = visible >= width ? content : `${content}${" ".repeat(width - visible)}`;
-        return this.styleAnsi(padded, CHOICE_SELECTED_ROW_STYLE);
     }
 
     private buildInputLayout(value: string, width: number, cursor: number): { lines: string[]; cursorRow: number; cursorCol: number } {
@@ -2010,36 +1888,6 @@ export class TerminalUi implements InteractiveUi {
 
     private renderStreamingBlock(block: StreamingBlockState, rawText = block.rawText): string {
         return block.variant === "thinking" ? this.renderThinkingBlock(rawText) : this.renderMarkdownBlock(rawText);
-    }
-
-    private getStreamingDelta(previousDisplay: string, nextDisplay: string): string {
-        if (nextDisplay.startsWith(previousDisplay)) return nextDisplay.slice(previousDisplay.length);
-        const commonPrefix = this.getCommonPrefixLength(previousDisplay, nextDisplay);
-        if (commonPrefix >= 32) return nextDisplay.slice(commonPrefix);
-        return nextDisplay;
-    }
-
-    private getStreamingDisplayText(block: StreamingBlockState): string {
-        if (block.variant !== "default") return block.rawText;
-        const raw = block.rawText;
-        if (raw.endsWith("\n")) return raw;
-        const lastNewline = raw.lastIndexOf("\n");
-        if (lastNewline < 0) return raw;
-        const trailingLine = raw.slice(lastNewline + 1);
-        if (!this.isUnstableTrailingMarkdownLine(trailingLine)) return raw;
-        return raw.slice(0, lastNewline + 1);
-    }
-
-    private isUnstableTrailingMarkdownLine(line: string): boolean {
-        return /^\s*\d{1,4}\.?\s*$/.test(line)
-            || /^\s*\d{1,4}\.\s+/.test(line)
-            || /^\s*[-*+]\s*$/.test(line)
-            || /^\s*[-*+]\s+/.test(line)
-            || /^\s*#{1,6}\s*$/.test(line)
-            || /^\s*#{1,6}\s+/.test(line)
-            || /^\s*>\s*$/.test(line)
-            || /^\s*>\s+/.test(line)
-            || /^\s*`{1,3}[A-Za-z0-9_+#.-]*\s*$/.test(line);
     }
 
     private renderToolTrace(trace: ToolHistorySnapshot): string {
@@ -2519,167 +2367,6 @@ export class TerminalUi implements InteractiveUi {
         return this.formatter.renderPanelBlock(lines, width, fillStyle);
     }
 
-    private readStartupAnsiPreview(path?: string | null): string | null {
-        if (!path) return null;
-        try {
-            const content = readFileSync(path, "utf8");
-            return content.length > 0 ? content : null;
-        } catch {
-            return null;
-        }
-    }
-
-    private renderStartupAnsiPreview(ansiPreview: string, card: StartupCard): string {
-        const dimensions = this.getAnsiPreviewDimensions(ansiPreview);
-        if (card.ansiImageMaxWidth === undefined && card.ansiImageMaxHeight === undefined) return ansiPreview;
-
-        const targetWidth = card.ansiImageMaxWidth ?? dimensions.width;
-        const targetHeight = card.ansiImageMaxHeight ?? dimensions.height;
-        if (targetWidth === dimensions.width && targetHeight === dimensions.height) return ansiPreview;
-        return this.resizeAnsiPreview(ansiPreview, targetWidth, targetHeight);
-    }
-
-    private resizeAnsiPreview(ansiPreview: string, targetWidth: number, targetHeight: number): string {
-        const sourceLines = ansiPreview.split("\n").filter((line) => line.length > 0);
-        if (sourceLines.length === 0) return "";
-        const boundedHeight = Math.max(1, Math.min(targetHeight, sourceLines.length));
-        const rowScale = sourceLines.length / boundedHeight;
-        const sampledRows: string[] = [];
-        for (let row = 0; row < boundedHeight; row += 1) {
-            const sourceRow = Math.min(sourceLines.length - 1, Math.floor((row + 0.5) * rowScale));
-            sampledRows.push(this.resizeAnsiLine(sourceLines[sourceRow], targetWidth));
-        }
-        return sampledRows.join("\n");
-    }
-
-    private resizeAnsiLine(line: string, targetWidth: number): string {
-        const cells = this.parseAnsiLineCells(line);
-        if (cells.length === 0 || targetWidth <= 0) return "";
-        const boundedWidth = Math.max(1, Math.min(targetWidth, cells.length));
-        if (boundedWidth === cells.length) return line;
-        const scale = cells.length / boundedWidth;
-        const sampled: string[] = [];
-        for (let column = 0; column < boundedWidth; column += 1) {
-            const sourceColumn = Math.min(cells.length - 1, Math.floor((column + 0.5) * scale));
-            sampled.push(cells[sourceColumn]);
-        }
-        return `${sampled.join("")}\u001b[0m`;
-    }
-
-    private parseAnsiLineCells(line: string): string[] {
-        const cells: string[] = [];
-        let activeAnsi = "";
-        for (let index = 0; index < line.length;) {
-            const escapeMatch = line.slice(index).match(/^\u001b\[[0-?]*[ -/]*[@-~]/);
-            if (escapeMatch) {
-                const sequence = escapeMatch[0];
-                activeAnsi = sequence === "\u001b[0m" ? "" : sequence;
-                index += sequence.length;
-                continue;
-            }
-            const codePoint = line.codePointAt(index);
-            if (codePoint === undefined) break;
-            const char = String.fromCodePoint(codePoint);
-            const charWidth = this.getVisibleTextWidth(char);
-            if (charWidth > 0) cells.push(`${activeAnsi}${char}`);
-            index += char.length;
-        }
-        return cells;
-    }
-
-    private getAnsiPreviewDimensions(ansiPreview: string): { width: number; height: number } {
-        const lines = ansiPreview.split("\n").filter((line) => line.length > 0);
-        const width = lines.reduce((max, line) => Math.max(max, this.getVisibleTextWidth(line)), 0);
-        return { width, height: lines.length };
-    }
-
-    private renderStartupCardBlock(card: StartupCard, ansiPreview: string | null): string {
-        const width = this.getOutputWidth();
-        const borderStyle: AnsiStyle = { fg: PROMPT_BORDER_COLOR, bold: true };
-        const titleStyle: AnsiStyle = { fg: "#ffffff", bold: true };
-        const metaStyle: AnsiStyle = { fg: "#d9fbf8" };
-        const mutedStyle: AnsiStyle = { fg: "#93a4b8", dim: true };
-        const innerWidth = Math.max(20, width - 4);
-        const title = card.subtitle ? `${card.title} — ${card.subtitle}` : card.title;
-        const rows: Array<{ text: string; style?: AnsiStyle }> = [{ text: title, style: titleStyle }];
-
-        const topLabel = ` ${card.title} `;
-        const horizontal = "─".repeat(Math.max(0, innerWidth - this.getVisibleTextWidth(topLabel)));
-        const lines = [this.styleAnsi(`┌${topLabel}${horizontal}┐`, borderStyle)];
-        lines.push(...rows.flatMap((row) => this.renderBorderedStartupRows(row.text, innerWidth, row.style ?? metaStyle, borderStyle)));
-
-        if (card.imagePath || card.ansiImagePath) {
-            if (ansiPreview) {
-                const renderedPreview = this.renderStartupAnsiPreview(ansiPreview, card);
-                lines.push(...this.renderBorderedAnsiImageRows(renderedPreview, innerWidth, borderStyle));
-            }
-        }
-
-        for (const line of card.lines) {
-            lines.push(...this.renderStartupDetailRows(line, innerWidth, metaStyle)
-                .flatMap((row) => this.renderBorderedStartupRows(row.text, innerWidth, row.style ?? metaStyle, borderStyle)));
-        }
-        lines.push(this.styleAnsi(`└${"─".repeat(innerWidth)}┘`, borderStyle));
-        return lines.join("\n");
-    }
-
-    private renderBorderedStartupRows(text: string, innerWidth: number, textStyle: AnsiStyle, borderStyle: AnsiStyle): string[] {
-        return this.wrapStyledLineWords(text, innerWidth).map((line) => {
-            const visible = this.getVisibleTextWidth(line);
-            const padded = visible >= innerWidth ? line : `${line}${" ".repeat(innerWidth - visible)}`;
-            return `${this.styleAnsi("│", borderStyle)}${this.styleAnsi(padded, textStyle)}${this.styleAnsi("│", borderStyle)}`;
-        });
-    }
-
-    private renderBorderedAnsiImageRows(ansiPreview: string, innerWidth: number, borderStyle: AnsiStyle): string[] {
-        const reset = "\u001b[0m";
-        return ansiPreview.split("\n").map((rawLine) => {
-            const line = this.fitAnsiLineToWidth(rawLine, innerWidth);
-            const visible = this.getVisibleTextWidth(line);
-            const totalPadding = Math.max(0, innerWidth - visible);
-            const leftPadding = " ".repeat(Math.floor(totalPadding / 2));
-            const rightPadding = " ".repeat(totalPadding - leftPadding.length);
-            return `${this.styleAnsi("│", borderStyle)}${leftPadding}${line}${reset}${rightPadding}${this.styleAnsi("│", borderStyle)}`;
-        });
-    }
-
-    private fitAnsiLineToWidth(line: string, width: number): string {
-        const visible = this.getVisibleTextWidth(line);
-        if (visible <= width) return line;
-        let result = "";
-        let columns = 0;
-        for (let index = 0; index < line.length;) {
-            const escapeMatch = line.slice(index).match(/^\u001b\[[0-?]*[ -/]*[@-~]/);
-            if (escapeMatch) {
-                result += escapeMatch[0];
-                index += escapeMatch[0].length;
-                continue;
-            }
-            const codePoint = line.codePointAt(index);
-            if (codePoint === undefined) break;
-            const char = String.fromCodePoint(codePoint);
-            const charWidth = this.getVisibleTextWidth(char);
-            if (columns + charWidth > width) break;
-            result += char;
-            columns += charWidth;
-            index += char.length;
-        }
-        return result;
-    }
-
-    private renderStartupDetailRows(detail: SessionDetailLine, width: number, style: AnsiStyle): Array<{ text: string; style?: AnsiStyle }> {
-        const left = detail.left.trim();
-        const right = detail.right?.trim() ?? "";
-        if (!left && !right) return [];
-        if (!right) return [{ text: left, style }];
-        const label = `${left}:`;
-        const labelWidth = this.getVisibleTextWidth(label);
-        const rightWidth = this.getVisibleTextWidth(right);
-        const gap = width - labelWidth - rightWidth;
-        if (gap >= 2) return [{ text: `${label}${" ".repeat(gap)}${right}`, style }];
-        return [{ text: label, style }, { text: right, style }];
-    }
-
     private getStartupImageWidthCells(): number {
         return Math.max(12, Math.min(32, Math.floor(this.getOutputWidth() / 3)));
     }
@@ -2718,48 +2405,6 @@ export class TerminalUi implements InteractiveUi {
 
     private wrapStyledLineWordsWithWidths(line: string, firstWidth: number, continuationWidth: number): string[] {
         return this.formatter.wrapStyledLineWordsWithWidths(line, firstWidth, continuationWidth);
-    }
-
-    private mergeStreamingText(previous: string, incoming: string): string {
-        if (!incoming) return previous;
-        if (!previous) return incoming;
-
-        // Providers normally send deltas, but some events can resend a full
-        // snapshot. Be deliberately conservative: short/common chunks such as
-        // spaces, punctuation, "is", or "the" may already appear somewhere in
-        // previous output and must still be appended. Dropping them produces the
-        // mashed-word output seen in long streams.
-        if (incoming === previous) return previous;
-        if (incoming.startsWith(previous)) return incoming;
-        if (incoming.length > previous.length && incoming.includes(previous)) return incoming;
-
-        // Some providers/proxies occasionally send cumulative snapshots through
-        // a field named "delta". If appended literally, the terminal shows the
-        // exact repeated growing-prefix pattern reported in real use. Treat a
-        // large incoming chunk that restarts with the same opening text as a
-        // replacement snapshot, even if the previous buffer was already poisoned
-        // by an earlier snapshot append and is no longer a strict prefix.
-        if (previous.length >= 80 && incoming.length >= 80) {
-            const commonPrefix = this.getCommonPrefixLength(previous, incoming);
-            const snapshotThreshold = Math.min(160, Math.floor(incoming.length * 0.6));
-            if (commonPrefix >= Math.max(48, snapshotThreshold) || (incoming.length >= 160 && commonPrefix >= 32)) return incoming;
-        }
-
-        // Only de-duplicate substantial suffix/prefix overlaps. Tiny overlaps
-        // are usually legitimate repeated characters/tokens in streamed deltas.
-        const maxOverlap = Math.min(previous.length, incoming.length);
-        for (let overlap = maxOverlap; overlap >= 12; overlap -= 1) {
-            if (previous.slice(-overlap) === incoming.slice(0, overlap)) return `${previous}${incoming.slice(overlap)}`;
-        }
-
-        return `${previous}${incoming}`;
-    }
-
-    private getCommonPrefixLength(left: string, right: string): number {
-        const max = Math.min(left.length, right.length);
-        let index = 0;
-        while (index < max && left.charCodeAt(index) === right.charCodeAt(index)) index += 1;
-        return index;
     }
 
     private getThinkingTraceTheme(): AnsiStyle { return this.formatter.getThinkingTraceTheme(); }

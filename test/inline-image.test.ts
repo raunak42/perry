@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import path from "node:path";
 import { test } from "bun:test";
 import { detectInlineImageProtocol, detectTerminalImageBackend, renderInlineImageData } from "../src/helpers/inlineImage";
 import { buildStartupCard, getStartupAnsiImagePath, getStartupAnsiImageSize, getStartupImagePath, resolveStartupImagePath } from "../src/helpers/startupImage";
@@ -34,7 +35,9 @@ test("startup image path resolves file URIs", () => {
     assert.equal(resolveStartupImagePath("file:///tmp/example%20image.png"), "/tmp/example image.png");
 });
 
-test("startup ANSI image path can be disabled or overridden", () => {
+test("startup ANSI image path defaults to packaged asset and can be disabled or overridden", () => {
+    const defaultPath = getStartupAnsiImagePath({});
+    assert.ok(defaultPath === null || path.basename(defaultPath) === "startup.ans");
     assert.equal(getStartupAnsiImagePath({ PERRY_STARTUP_IMAGE_ANSI: "off" }), null);
     assert.equal(getStartupAnsiImagePath({ PERRY_STARTUP_IMAGE_ANSI: "/tmp/perry.ansi" }), "/tmp/perry.ansi");
 });

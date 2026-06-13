@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "perry",
+      "name": "@perry-ai/cli",
       "dependencies": {
         "commander": "^14.0.3",
         "cors": "^2.8.6",

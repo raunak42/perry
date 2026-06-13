@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "bun:test";
 import { TerminalUi } from "../src/ui/terminal-ui";
+import { mergeStreamingText } from "../src/ui/streaming-rendering";
 
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const RESIZE_SETTLE_DELAY_FOR_TEST_MS = 180;
@@ -22,11 +23,10 @@ async function stream(ui: TerminalUi, variant: "default" | "thinking", chunks: s
     ui.finishStreamingBlock(blockId);
 }
 
-function assertStreamingMergeDoesNotDropCommonChunks(ui: TerminalUi): void {
-    const merge = (ui as unknown as { mergeStreamingText(previous: string, incoming: string): string }).mergeStreamingText.bind(ui);
+function assertStreamingMergeDoesNotDropCommonChunks(): void {
     let text = "Streaming fixture: the parser sees common tokens";
     for (const chunk of [" ", "the", " same", " token", " is", " preserved", "."]) {
-        text = merge(text, chunk);
+        text = mergeStreamingText(text, chunk);
     }
 
     const expected = "Streaming fixture: the parser sees common tokens the same token is preserved.";
@@ -1430,7 +1430,7 @@ test("startup ANSI preview is centered at native size", assertStartupAnsiPreview
 test("streaming merge keeps common chunks", async () => {
     const ui = await TerminalUi.create();
     try {
-        assertStreamingMergeDoesNotDropCommonChunks(ui);
+        assertStreamingMergeDoesNotDropCommonChunks();
     } finally {
         ui.destroy();
     }
