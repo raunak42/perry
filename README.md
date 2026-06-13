@@ -74,7 +74,7 @@ npm version patch
 git push --follow-tags
 ```
 
-Pushing a `v*.*.*` tag runs the release workflow, validates the package, and publishes to npm. The release workflow can also be started manually from GitHub Actions.
+Pushing a `v*.*.*` tag runs the release workflow, validates the package, and publishes to npm. The release workflow can also be started manually from GitHub Actions. Normal pushes to `main` run CI only; they do not publish.
 
 ## Architecture Inspiration
 
