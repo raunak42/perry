@@ -49,10 +49,22 @@ bun run build
 npm pack --dry-run
 ```
 
-Source/dev Perry already defaults to `~/.perry-dev`, separate from installed Perry's `~/.perry-ai`. You can still override it explicitly:
+To install a local development command that launches this source checkout from any repo:
 
 ```bash
-PERRY_HOME=~/.perry-dev-custom bun run dev
+bun run dev:install
+```
+
+Then run source/dev Perry anywhere with:
+
+```bash
+perry-dev
+```
+
+`perry-dev` keeps the current directory as the target repo while loading Perry from this source checkout. It defaults to `~/.perry-dev`, separate from installed Perry's `~/.perry-ai`. You can still override it explicitly:
+
+```bash
+PERRY_HOME=~/.perry-dev-custom perry-dev
 ```
 
 ## Releases

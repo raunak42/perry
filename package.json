@@ -24,6 +24,7 @@
   "scripts": {
     "test": "bun test ./test",
     "dev": "bun run ./src/index.ts",
+    "dev:install": "node ./scripts/install-dev-command.cjs",
     "build": "node ./scripts/clean-dist.cjs && tsc -p tsconfig.build.json",
     "prepack": "bun x tsc --noEmit && bun test && bun run build",
     "pack:dry": "npm pack --dry-run",
