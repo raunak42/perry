@@ -1282,6 +1282,20 @@ async function assertThinkingStreamUsesRemainingLineWidthBeforeWrapping(): Promi
     assert.equal(screen.includes(" t\no cross the viewport") || screen.includes("\n to cross the viewport"), false);
 }
 
+async function assertStreamingSoftWrapDoesNotLeaveLeadingContinuationSpace(): Promise<void> {
+    const raw = await captureTerminalOutput(21, 10, async (ui) => {
+        const blockId = ui.startStreamingBlock("", "thinking");
+        ui.appendToStreamingBlock(blockId, "12345678901234567890");
+        await wait(1);
+        ui.appendToStreamingBlock(blockId, " next words continue cleanly");
+        await wait(1);
+        ui.finishStreamingBlock(blockId);
+    });
+    const screen = emulateTerminalFinalScreen(raw, 21);
+    assert.match(screen, /12345678901234567890\nnext words continue/);
+    assert.equal(screen.includes("\n next words continue"), false);
+}
+
 async function assertClearBusyPrintsWorkedLine(): Promise<void> {
     const raw = await captureTerminalOutput(80, 8, async (ui) => {
         ui.setBusy("Working");
@@ -1471,6 +1485,7 @@ test("bare slash shows windowed command suggestions with indicator", assertBareS
 test("slash command suggestion window scrolls with selection", assertSlashCommandSuggestionWindowScrollsWithSelection);
 test("prompt renders repo and context metadata below the input box", assertPromptRendersRepoAndContextMetadataBelowInput);
 test("thinking streams keep using remaining line width before wrapping", assertThinkingStreamUsesRemainingLineWidthBeforeWrapping);
+test("streaming soft wraps do not leave leading continuation spaces", assertStreamingSoftWrapDoesNotLeaveLeadingContinuationSpace);
 test("clearing busy prints a worked duration line", assertClearBusyPrintsWorkedLine);
 test("busy overflow streams do not repeat or split content", assertBusyOverflowStreamDoesNotRepeatOrSplit);
 test("terminal ui smoke flow completes", assertFullSmokeFlowCompletes);

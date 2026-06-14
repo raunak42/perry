@@ -1635,10 +1635,16 @@ export class TerminalUi implements InteractiveUi {
         for (let index = 0; index < parts.length; index += 1) {
             let part = parts[index] ?? "";
             if (part.length > 0) {
+                let forcedSoftWrap = false;
                 if (block.appendColumn >= width) {
                     this.writeStdout("\n");
                     block.appendColumn = 0;
                     block.cursorDetachedAfterRewrite = false;
+                    forcedSoftWrap = true;
+                }
+
+                if (forcedSoftWrap && /^[ \t]+\S/.test(part)) {
+                    part = part.trimStart();
                 }
 
                 if (block.appendColumn > 0 && /^[ \t]+\S/.test(part)) {
