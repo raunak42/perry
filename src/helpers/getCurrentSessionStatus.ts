@@ -24,7 +24,6 @@ export const getCurrentSessionStatus = async (state: State) => {
         state.pendingPlanExecution = false;
         state.activeSkill = null;
 
-        writeOutput("Using saved OpenAI API key.");
     } else if (auth?.activeProvider === "openai-codex" && auth.openaiCodex) {
         state.activeProvider = "openai-codex";
         state.currentModel = resolveDefaultModel("openai-codex", auth);
@@ -35,7 +34,6 @@ export const getCurrentSessionStatus = async (state: State) => {
         state.planMode = false;
         state.pendingPlanExecution = false;
         state.activeSkill = null;
-        writeOutput("Using saved ChatGPT/Codex subscription login.");
 
     } else {
         writeOutput("Not logged in. Type /login to continue.");

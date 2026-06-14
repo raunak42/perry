@@ -48,7 +48,7 @@ test("startup ANSI image size env overrides are optional and configurable", () =
     assert.deepEqual(getStartupAnsiImageSize({ PERRY_STARTUP_IMAGE_ANSI_WIDTH: "bad", PERRY_STARTUP_IMAGE_ANSI_HEIGHT: "0" }), { width: undefined, height: undefined });
 });
 
-test("buildStartupCard includes session metadata without image details", () => {
+test("buildStartupCard includes only minimal startup metadata without image details", () => {
     const card = buildStartupCard({
         sessionId: "abcdef123456",
         persisted: true,
@@ -68,13 +68,12 @@ test("buildStartupCard includes session metadata without image details", () => {
 
     assert.equal(card.title, "Perry");
     assert.equal(card.imagePath, "/tmp/image.png");
-    assert.ok(card.lines.some((line) => line.left === "Session" && line.right === "abcdef12"));
-    assert.ok(card.lines.some((line) => line.left === "Model" && line.right === "gpt-5.4 · high"));
-    assert.ok(card.lines.some((line) => line.left === "Subagents" && line.right === "disabled · thinking medium"));
-    assert.ok(card.lines.some((line) => line.left === "Context files" && line.right === "AGENTS.md, CLAUDE.md"));
-    assert.ok(card.lines.some((line) => line.left === "Permissions" && line.right === "ask"));
-    assert.ok(card.lines.some((line) => line.left === "Plan mode" && line.right === "disabled"));
-    assert.ok(card.lines.some((line) => line.left === "Skills" && line.right === "0"));
+    assert.deepEqual(card.lines, [
+        { left: "Provider", right: "openai-api-key" },
+        { left: "Model", right: "gpt-5.4 · high" },
+        { left: "Plan mode", right: "disabled" },
+        { left: "Directory", right: "/repo" },
+    ]);
     assert.ok(!card.lines.some((line) => line.left === "Startup image"));
 });
 

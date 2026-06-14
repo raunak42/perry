@@ -73,24 +73,11 @@ export function buildStartupCard(params: {
     activeSkillName?: string | null;
 }): StartupCard {
     const lines: SessionDetailLine[] = [
-        { left: "Session", right: `${params.sessionId.slice(0, 8)}${params.persisted ? "" : " · memory"}` },
-        { left: "Messages", right: String(params.messageCount) },
         { left: "Provider", right: params.provider ?? "not logged in" },
         { left: "Model", right: `${params.model} · ${params.reasoningLevel}` },
-        { left: "Subagents", right: `${params.subagentsMode ? "enabled" : "disabled"} · thinking ${params.subagentReasoningLevel ?? "medium"}` },
-        { left: "Context", right: params.contextLevel },
-        { left: "Permissions", right: params.permissionMode ?? "ask" },
         { left: "Plan mode", right: params.planMode ? "enabled" : "disabled" },
-        { left: "Skills", right: `${params.skillCount ?? 0}${params.activeSkillName ? ` · active: ${params.activeSkillName}` : ""}` },
         { left: "Directory", right: params.cwd },
     ];
-    if (params.sessionDir) lines.push({ left: "Session dir", right: params.sessionDir });
-    if (params.contextFiles && params.contextFiles.length > 0) {
-        lines.push({
-            left: "Context files",
-            right: params.contextFiles.map((contextFile) => path.basename(contextFile.path)).join(", "),
-        });
-    }
 
     return {
         title: "Perry",

@@ -139,7 +139,7 @@ Keep this file accurate whenever Perry's user-visible behavior, slash commands, 
 - Source/dev Perry can install a separate local `perry-dev` command with `bun run dev:install`; `perry-dev` launches the source checkout from any repo while preserving the caller's current directory as the target project.
 - Installed Perry loads its bundled `SELF_MANIFEST.md` from the package installation, while project context files, project MCP config, and project skills are loaded from the user's current working directory tree.
 - CI runs typecheck, tests, build, and npm pack dry-run on pushes and pull requests to `main`; release publishing runs from `v*.*.*` tags or manual GitHub Actions dispatch using npm Trusted Publishing/OIDC instead of a long-lived `NPM_TOKEN` secret.
-- The startup card shows session, provider/model, subagents mode/thinking, context, permissions, plan mode, current directory, and loaded context files, with a Perry-like teal border.
+- The startup card is intentionally minimal: it shows provider, model/thinking, plan mode, and current directory, with a Perry-like teal border.
 - Perry saves the selected `/model` model and reasoning level per provider in its auth/preferences file, so future starts with that provider use the same model and thinking.
 - Startup image paths can be configured with Perry startup-image environment variables; the npm package includes a bundled ANSI startup image when available.
 
