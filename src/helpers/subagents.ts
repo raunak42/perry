@@ -23,7 +23,7 @@ export interface RunSubagentParams extends SpawnSubagentArgs {
 export const SPAWN_SUBAGENT_TOOL_DEFINITION: OpenAI.Responses.FunctionTool = {
     type: "function",
     name: SPAWN_SUBAGENT_TOOL_NAME,
-    description: "Spawn a generic Perry subagent to handle an assigned task in an isolated context. The subagent inherits Perry's current permissions and can use the same tools subject to those permissions.",
+    description: "Spawn a generic Perry subagent to handle an assigned task in an isolated context. For independent subtasks, emit multiple spawn_subagent calls in the same response so Perry can run them in parallel. The subagent inherits Perry's current permissions and can use the same tools subject to those permissions.",
     parameters: {
         type: "object",
         properties: {
@@ -98,6 +98,7 @@ export function buildSubagentInstructions(baseInstructions: string, options: {
         "<subagent_mode>",
         "You are a Perry subagent running inside an isolated model/tool loop for the main Perry agent.",
         "You are generic: complete the task assigned by the main agent, not a predefined role.",
+        "If you need several independent investigations, request multiple spawn_subagent calls in the same assistant turn instead of doing them one at a time; Perry can run those sibling subagents in parallel.",
         "You may use the same tools as Perry, subject to the inherited permission mode and any active plan-mode restrictions.",
         `Inherited permission mode: ${options.permissionMode}.`,
         `Subagents mode: ${options.subagentsMode ? "enabled" : "disabled"}.`,

@@ -100,6 +100,42 @@ type RetainedHistoryBlock =
  * ignored to avoid clearing/replaying scrollback when a terminal merely regains
  * focus.
  */
+class SilentTerminalUi implements InteractiveUi {
+    constructor(private readonly parent: InteractiveUi) {}
+    onEscape(listener: () => void): () => void { return this.parent.onEscape?.(listener) ?? (() => undefined); }
+    ask(prompt: string, options?: PromptOptions): Promise<string> { return this.parent.ask(prompt, options); }
+    choose<T = string>(prompt: string, options: ChoiceOption<T>[], initialValue?: T): Promise<T> { return this.parent.choose(prompt, options, initialValue); }
+    write(): void { /* intentionally hidden */ }
+    writeWarning(): void { /* intentionally hidden */ }
+    writeError(): void { /* intentionally hidden */ }
+    writeUser(): void { /* intentionally hidden */ }
+    writeAssistant(): void { /* intentionally hidden */ }
+    writeThinking(): void { /* intentionally hidden */ }
+    writeStartupCard(): void { /* intentionally hidden */ }
+    startStreamingBlock(): string { return "silent-stream"; }
+    appendToStreamingBlock(): void { /* intentionally hidden */ }
+    finishStreamingBlock(): void { /* intentionally hidden */ }
+    showToolCall(): void { /* intentionally hidden */ }
+    showToolCallArguments(): void { /* intentionally hidden */ }
+    updateToolCallArguments(): void { /* intentionally hidden */ }
+    startToolExecution(): void { /* intentionally hidden */ }
+    updateToolExecution(): void { /* intentionally hidden */ }
+    finishToolExecution(): void { /* intentionally hidden */ }
+    restoreToolTrace(): void { /* intentionally hidden */ }
+    onToolTraceFinished(): () => void { return () => undefined; }
+    createSilentClone(): InteractiveUi { return this; }
+    expandTrace(): boolean { return false; }
+    refreshHistory(): void { /* intentionally hidden */ }
+    setStatus(message: string): void { this.parent.setStatus(message); }
+    setReasoningLevel(level: string): void { this.parent.setReasoningLevel(level); }
+    setSessionDetails(lines: SessionDetailLine[]): void { this.parent.setSessionDetails(lines); }
+    setBusy(message?: string): void { this.parent.setBusy(message); }
+    clearBusy(options?: { showWorkedLine?: boolean }): void { this.parent.clearBusy(options); }
+    cancelActiveInput(): void { this.parent.cancelActiveInput(); }
+    triggerEscape(): void { this.parent.triggerEscape(); }
+    destroy(): void { /* parent owns lifecycle */ }
+}
+
 export class TerminalUi implements InteractiveUi {
     private readonly formatter = new TerminalFormatter(() => this.getTerminalWidth());
     private readonly bottomArea = new BottomArea({
@@ -861,6 +897,10 @@ export class TerminalUi implements InteractiveUi {
     onToolTraceFinished(listener: (trace: PersistableToolTrace) => void): () => void {
         this.toolTraceFinishedListeners.add(listener);
         return () => this.toolTraceFinishedListeners.delete(listener);
+    }
+
+    createSilentClone(): InteractiveUi {
+        return new SilentTerminalUi(this);
     }
 
     onEscape(listener: () => void): () => void {

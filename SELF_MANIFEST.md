@@ -85,7 +85,7 @@ Keep this file accurate whenever Perry's user-visible behavior, slash commands, 
 - Subagents use the same current working directory and can use Perry's local tools, MCP tools, and web search subject to inherited permissions and provider/tool availability.
 - Default subagent thinking level is `medium`.
 - `/settings` includes a Subagents mode toggle and a Subagent thinking option to change the reasoning level used by spawned subagents.
-- Subagent traces are labeled as subagent activity and include task, mode, turns, and final result.
+- Subagent traces are labeled as subagent activity and include task, mode, turns, and final result; inner subagent read/write/edit/shell/MCP traces are hidden from the main TUI so users see only Perry's own traces plus the subagent summary trace.
 
 ## Skills
 

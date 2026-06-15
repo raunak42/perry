@@ -69,6 +69,7 @@ export interface InteractiveUi {
     finishToolExecution(id: string, output: string, isError?: boolean, details?: unknown): void;
     restoreToolTrace?(trace: PersistableToolTrace): void;
     onToolTraceFinished?(listener: (trace: PersistableToolTrace) => void): () => void;
+    createSilentClone?(): InteractiveUi;
     expandTrace(reference: string): boolean;
     refreshHistory(): void;
     setStatus(message: string): void;

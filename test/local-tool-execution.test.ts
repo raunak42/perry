@@ -81,6 +81,44 @@ test("spawn_subagent calls in the same tool batch run in parallel", async () => 
     assert.ok(elapsed < 140, `expected parallel execution to finish quickly, took ${elapsed}ms`);
 });
 
+test("ask mode subagent batches request permission once and still run in parallel", async () => {
+    let permissionPrompts = 0;
+    const starts: number[] = [];
+    const tools: Array<Tool<any, any>> = [
+        {
+            name: "spawn_subagent",
+            definition: { type: "function", name: "spawn_subagent", parameters: {} } as any,
+            execute: async (args) => {
+                starts.push(Date.now());
+                await delay(80);
+                return { output: `done ${args.task}` };
+            },
+        },
+    ];
+
+    const startedAt = Date.now();
+    const results = await executeLocalToolCalls([
+        makeFunctionCall("spawn_subagent", "call-a", { task: "A" }),
+        makeFunctionCall("spawn_subagent", "call-b", { task: "B" }),
+    ], tools, createNoopUi(), {
+        permissionMode: "ask",
+        promptForPermission: async (evaluation) => {
+            permissionPrompts += 1;
+            assert.equal(evaluation.summary, "spawn 2 subagents in parallel");
+            await delay(20);
+            return true;
+        },
+    });
+    const elapsed = Date.now() - startedAt;
+
+    assert.deepEqual(results.map((result) => result.toolCall.call_id), ["call-a", "call-b"]);
+    assert.deepEqual(results.map((result) => result.result.output), ["done A", "done B"]);
+    assert.equal(permissionPrompts, 1, "parallel subagent batch should ask once");
+    assert.equal(starts.length, 2);
+    assert.ok(Math.abs(starts[0]! - starts[1]!) < 50, `subagents did not start together: ${starts.join(", ")}`);
+    assert.ok(elapsed < 160, `expected ask-mode parallel execution after approval, took ${elapsed}ms`);
+});
+
 test("non-subagent calls stay ordered around parallel subagent batches", async () => {
     const events: string[] = [];
     const tools: Array<Tool<any, any>> = [

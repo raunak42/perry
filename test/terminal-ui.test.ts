@@ -512,6 +512,24 @@ async function assertPromptCursorDoesNotWrapBeforeInputFrameExpands(): Promise<v
     assert.equal(state.cursorCol, 19);
 }
 
+async function assertSilentCloneHidesSubagentInnerTraces(): Promise<void> {
+    const transcript = await captureTerminalOutput(100, 30, async (ui) => {
+        const silent = ui.createSilentClone?.();
+        assert.ok(silent, "TerminalUi should expose a silent clone");
+        silent.showToolCall("hidden-read", "read", { path: "package.json" }, "pending");
+        silent.startToolExecution("hidden-read");
+        silent.finishToolExecution("hidden-read", "hidden output");
+        ui.showToolCall("visible-subagent", "spawn_subagent", { task: "inspect" }, "pending");
+        ui.startToolExecution("visible-subagent");
+        ui.finishToolExecution("visible-subagent", "Subagent done");
+        await wait(5);
+    });
+
+    assert.doesNotMatch(transcript, /package\.json/);
+    assert.doesNotMatch(transcript, /hidden output/);
+    assert.match(transcript, /Subagent done/);
+}
+
 async function assertReadTraceUsesPiMonoStyleCard(): Promise<void> {
     const raw = await captureTerminalOutput(100, 12, async (ui) => {
         ui.showToolCall("read-trace", "read", { path: "src/tools/readFile.ts", offset: 1, limit: 3 }, "complete", "ok", {
@@ -1476,6 +1494,7 @@ test("prompt up/down navigates message history", assertPromptUpDownNavigatesHist
 test("prompt up moves within wrapped draft before history", assertPromptUpMovesWithinWrappedDraftBeforeHistory);
 test("prompt bracketed paste preserves multiline text without submitting", assertPromptBracketedPastePreservesMultilineTextWithoutSubmitting);
 test("prompt cursor does not wrap before input frame expands", assertPromptCursorDoesNotWrapBeforeInputFrameExpands);
+test("silent clone hides subagent inner traces", assertSilentCloneHidesSubagentInnerTraces);
 test("read trace uses pi-mono style card", assertReadTraceUsesPiMonoStyleCard);
 test("edit trace uses diff card without fence markers", assertEditTraceUsesDiffCardWithoutFenceMarkers);
 test("live edit trace hides huge arguments until diff is ready", assertEditTraceDoesNotRenderHugeArgumentsBeforeDiff);

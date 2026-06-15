@@ -298,6 +298,7 @@ async function runSubagentLoop(params: {
     signal?: AbortSignal;
 }): Promise<{ output: string; turnsUsed: number; details: SubagentTraceDetails }> {
     const { state, task, ui } = params;
+    const subagentUi = ui.createSilentClone?.() ?? ui;
     if (task.depth > MAX_SUBAGENT_DEPTH) {
         throw new Error(`Subagent nesting limit reached (${MAX_SUBAGENT_DEPTH}).`);
     }
@@ -383,7 +384,7 @@ async function runSubagentLoop(params: {
                 state.currentModel,
                 reasoningLevel,
                 state.contextLevel,
-                ui,
+                subagentUi,
                 { streamOutput: false, signal: params.signal },
             );
             aiResponse = streamed.response;
@@ -425,7 +426,7 @@ async function runSubagentLoop(params: {
             };
         }
 
-        const executedToolCalls = await executeLocalToolCalls(toolCalls, localTools, ui, {
+        const executedToolCalls = await executeLocalToolCalls(toolCalls, localTools, subagentUi, {
             planMode: state.planMode,
             permissionMode: state.permissionMode,
             getPermissionMode: () => state.permissionMode,
@@ -499,25 +500,24 @@ async function main(options: CliOptions = {}) {
         ui.cancelActiveInput();
     };
     const unsubscribeEscape = ui.onEscape?.(requestStopActiveTurn);
+    let userActionPromptQueue: Promise<unknown> = Promise.resolve();
+    const runUserActionPrompt = <T>(operation: () => Promise<T>): Promise<T> => {
+        const run = async (): Promise<T> => {
+            await promptController.pause();
+            try {
+                playResponseDoneSound();
+                return await operation();
+            } finally {
+                promptController.resume();
+            }
+        };
+        const next = userActionPromptQueue.then(run, run);
+        userActionPromptQueue = next.catch(() => undefined);
+        return next;
+    };
     const planModeInteractionTools = createPlanModeInteractionTools({
-        choose: async (prompt, options, initialValue) => {
-            await promptController.pause();
-            try {
-                playResponseDoneSound();
-                return await ui.choose(prompt, options, initialValue);
-            } finally {
-                promptController.resume();
-            }
-        },
-        ask: async (prompt) => {
-            await promptController.pause();
-            try {
-                playResponseDoneSound();
-                return await ui.ask(prompt, { placeholder: "Write what you want" });
-            } finally {
-                promptController.resume();
-            }
-        },
+        choose: async (prompt, options, initialValue) => runUserActionPrompt(() => ui.choose(prompt, options, initialValue)),
+        ask: async (prompt) => runUserActionPrompt(() => ui.ask(prompt, { placeholder: "Write what you want" })),
     });
     const mcpManager = new McpManager(process.cwd());
     await withBusyIndicator(ui, "Loading MCP servers", () => mcpManager.load().catch((error) => {
@@ -658,9 +658,9 @@ async function main(options: CliOptions = {}) {
     });
 
     const promptForPermissionApproval = async (evaluation: PermissionEvaluation): Promise<boolean> => {
-        await promptController.pause();
-        try {
-            playResponseDoneSound();
+        if (state.permissionMode === "full-access") return true;
+        return runUserActionPrompt(async () => {
+            if (state.permissionMode === "full-access") return true;
             const choice = await ui.choose("Permission required", [
                 {
                     label: "Allow once",
@@ -692,9 +692,7 @@ async function main(options: CliOptions = {}) {
             }
             ui.write(`Denied: ${evaluation.summary}`);
             return false;
-        } finally {
-            promptController.resume();
-        }
+        });
     };
 
     spawnSubagentTool = createSpawnSubagentTool({
