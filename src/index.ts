@@ -431,6 +431,7 @@ async function runSubagentLoop(params: {
             permissionMode: state.permissionMode,
             getPermissionMode: () => state.permissionMode,
             promptForPermission: params.promptForPermission,
+            autoApprovePermissionPrompts: true,
             signal: params.signal,
         });
         const toolOutputs: Array<{ type: "function_call_output"; call_id: string; output: ResponseInputItem.FunctionCallOutput["output"] }> = executedToolCalls.map(({ toolCall, result }) => ({

@@ -319,9 +319,7 @@ export function evaluateToolPermission(request: ToolPermissionRequest): Permissi
     }
 
     if (toolName === SPAWN_SUBAGENT_TOOL_NAME) {
-        if (mode === "full-access") return allow(mode, toolName, "full-access mode auto-approves subagents");
-        if (mode === "read-only") return allow(mode, toolName, "subagents inherit read-only permissions");
-        return ask(mode, toolName, "subagents can use Perry tools with inherited permissions");
+        return allow(mode, toolName, "subagents mode already grants permission to spawn subagents; their tools still inherit Perry permissions");
     }
 
     if (mode === "full-access") {

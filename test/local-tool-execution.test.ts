@@ -81,7 +81,7 @@ test("spawn_subagent calls in the same tool batch run in parallel", async () => 
     assert.ok(elapsed < 140, `expected parallel execution to finish quickly, took ${elapsed}ms`);
 });
 
-test("ask mode subagent batches request permission once and still run in parallel", async () => {
+test("ask mode subagent batches spawn without prompt and still run in parallel", async () => {
     let permissionPrompts = 0;
     const starts: number[] = [];
     const tools: Array<Tool<any, any>> = [
@@ -102,10 +102,8 @@ test("ask mode subagent batches request permission once and still run in paralle
         makeFunctionCall("spawn_subagent", "call-b", { task: "B" }),
     ], tools, createNoopUi(), {
         permissionMode: "ask",
-        promptForPermission: async (evaluation) => {
+        promptForPermission: async () => {
             permissionPrompts += 1;
-            assert.equal(evaluation.summary, "spawn 2 subagents in parallel");
-            await delay(20);
             return true;
         },
     });
@@ -113,10 +111,51 @@ test("ask mode subagent batches request permission once and still run in paralle
 
     assert.deepEqual(results.map((result) => result.toolCall.call_id), ["call-a", "call-b"]);
     assert.deepEqual(results.map((result) => result.result.output), ["done A", "done B"]);
-    assert.equal(permissionPrompts, 1, "parallel subagent batch should ask once");
+    assert.equal(permissionPrompts, 0, "enabled subagents should not need an extra spawn approval prompt");
     assert.equal(starts.length, 2);
     assert.ok(Math.abs(starts[0]! - starts[1]!) < 50, `subagents did not start together: ${starts.join(", ")}`);
-    assert.ok(elapsed < 160, `expected ask-mode parallel execution after approval, took ${elapsed}ms`);
+    assert.ok(elapsed < 140, `expected ask-mode parallel execution without spawn approval prompt, took ${elapsed}ms`);
+});
+
+test("auto-approved subagent runs skip ask prompts but still enforce denials", async () => {
+    let permissionPrompts = 0;
+    const tools: Array<Tool<any, any>> = [
+        {
+            name: "write",
+            definition: { type: "function", name: "write", parameters: {} } as any,
+            execute: async () => ({ output: "wrote" }),
+        },
+    ];
+
+    const askResults = await executeLocalToolCalls([
+        makeFunctionCall("write", "call-write", { path: "demo.txt", content: "hello" }),
+    ], tools, createNoopUi(), {
+        permissionMode: "ask",
+        autoApprovePermissionPrompts: true,
+        promptForPermission: async () => {
+            permissionPrompts += 1;
+            return false;
+        },
+    });
+
+    assert.equal(permissionPrompts, 0, "approved subagent runs should not prompt for ask-mode tool calls");
+    assert.equal(askResults[0]!.result.output, "wrote");
+    assert.equal(askResults[0]!.result.isError, false);
+
+    const readOnlyResults = await executeLocalToolCalls([
+        makeFunctionCall("write", "call-write-readonly", { path: "demo.txt", content: "hello" }),
+    ], tools, createNoopUi(), {
+        permissionMode: "read-only",
+        autoApprovePermissionPrompts: true,
+        promptForPermission: async () => {
+            permissionPrompts += 1;
+            return true;
+        },
+    });
+
+    assert.equal(permissionPrompts, 0, "denied modes should not prompt before blocking");
+    assert.equal(readOnlyResults[0]!.result.isError, true);
+    assert.match(readOnlyResults[0]!.result.output, /Blocked by permissions/);
 });
 
 test("non-subagent calls stay ordered around parallel subagent batches", async () => {

@@ -78,9 +78,9 @@ test("full-access / yolo mode allows tool calls while hard run_command safety ru
     assert.equal(evaluateToolPermission({ mode: "full-access", toolName: "spawn_subagent", args: { task: "test" }, cwd }).action, "allow");
 });
 
-test("subagents inherit permission modes", () => {
-    assert.equal(evaluateToolPermission({ mode: "ask", toolName: "spawn_subagent", args: { task: "test" }, cwd }).action, "ask");
-    assert.equal(evaluateToolPermission({ mode: "workspace-write", toolName: "spawn_subagent", args: { task: "test" }, cwd }).action, "ask");
+test("subagents can spawn without extra approval and inherit permission modes for their own tools", () => {
+    assert.equal(evaluateToolPermission({ mode: "ask", toolName: "spawn_subagent", args: { task: "test" }, cwd }).action, "allow");
+    assert.equal(evaluateToolPermission({ mode: "workspace-write", toolName: "spawn_subagent", args: { task: "test" }, cwd }).action, "allow");
     assert.equal(evaluateToolPermission({ mode: "read-only", toolName: "spawn_subagent", args: { task: "test" }, cwd }).action, "allow");
     assert.equal(evaluateToolPermission({ mode: "full-access", toolName: "spawn_subagent", args: { task: "test" }, cwd }).action, "allow");
 });

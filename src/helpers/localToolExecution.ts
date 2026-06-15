@@ -25,6 +25,7 @@ export type LocalToolExecutionOptions = {
     getPermissionMode?: () => PermissionMode;
     promptForPermission?: (evaluation: PermissionEvaluation) => Promise<boolean>;
     skipPermission?: boolean;
+    autoApprovePermissionPrompts?: boolean;
     signal?: AbortSignal;
 };
 
@@ -120,7 +121,7 @@ export async function executeLocalToolCall(
             };
         }
 
-        if (permission.action === "ask") {
+        if (permission.action === "ask" && !options.autoApprovePermissionPrompts) {
             const approved = await options.promptForPermission?.(permission);
             if (!approved) {
                 const message = `Denied by user: ${permission.summary}.`;
@@ -215,7 +216,7 @@ export async function executeLocalToolCalls(
             continue;
         }
 
-        if (permission.action === "ask") {
+        if (permission.action === "ask" && !options.autoApprovePermissionPrompts) {
             const approved = await options.promptForPermission?.({
                 ...permission,
                 summary: `spawn ${group.length} subagents in parallel`,
