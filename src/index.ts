@@ -47,7 +47,7 @@ import {
     isFunctionCallItem as isExtractedFunctionCallItem,
     isReasoningItem as isExtractedReasoningItem,
 } from "./helpers/providerNativeTraceManager";
-import { executeLocalToolCall } from "./helpers/localToolExecution";
+import { executeLocalToolCalls } from "./helpers/localToolExecution";
 import { createPersistentPromptController } from "./helpers/persistentPromptController";
 import { createAssistantTextStreamer, createThinkingTraceStreamer } from "./helpers/streamingText";
 import { createMcpTools, McpManager } from "./helpers/mcp";
@@ -425,20 +425,18 @@ async function runSubagentLoop(params: {
             };
         }
 
-        const toolOutputs: Array<{ type: "function_call_output"; call_id: string; output: ResponseInputItem.FunctionCallOutput["output"] }> = [];
-        for (const toolCall of toolCalls) {
-            const toolResult = await executeLocalToolCall(toolCall, localTools, ui, {
-                planMode: state.planMode,
-                permissionMode: state.permissionMode,
-                promptForPermission: params.promptForPermission,
-                signal: params.signal,
-            });
-            toolOutputs.push({
-                type: "function_call_output",
-                call_id: toolCall.call_id,
-                output: toolResult.modelOutput ?? toolResult.output,
-            });
-        }
+        const executedToolCalls = await executeLocalToolCalls(toolCalls, localTools, ui, {
+            planMode: state.planMode,
+            permissionMode: state.permissionMode,
+            getPermissionMode: () => state.permissionMode,
+            promptForPermission: params.promptForPermission,
+            signal: params.signal,
+        });
+        const toolOutputs: Array<{ type: "function_call_output"; call_id: string; output: ResponseInputItem.FunctionCallOutput["output"] }> = executedToolCalls.map(({ toolCall, result }) => ({
+            type: "function_call_output",
+            call_id: toolCall.call_id,
+            output: result.modelOutput ?? result.output,
+        }));
 
         conversation.push(...assistantContextItems, ...toolOutputs);
         codexConversation.push(...assistantContextItems, ...toolOutputs);
@@ -1151,23 +1149,22 @@ async function main(options: CliOptions = {}) {
                         const toolOutputs: Array<{ type: "function_call_output"; call_id: string; output: ResponseInputItem.FunctionCallOutput["output"] }> = [];
                         let planCompletion: unknown = null;
 
-                        for (const toolCall of toolCalls) {
-                            ui.setStatus(`Running tool: ${toolCall.name}`);
-                            throwIfAborted(turnSignal);
-                            const toolResult = await executeLocalToolCall(toolCall, activeLocalTools, ui, {
-                                planMode: planModeForTurn,
-                                permissionMode: state.permissionMode,
-                                promptForPermission: promptForPermissionApproval,
-                                signal: turnSignal,
-                            });
-                            throwIfAborted(turnSignal);
+                        const executedToolCalls = await executeLocalToolCalls(toolCalls, activeLocalTools, ui, {
+                            planMode: planModeForTurn,
+                            permissionMode: state.permissionMode,
+                            getPermissionMode: () => state.permissionMode,
+                            promptForPermission: promptForPermissionApproval,
+                            signal: turnSignal,
+                        });
+
+                        for (const { toolCall, result } of executedToolCalls) {
                             toolOutputs.push({
                                 type: "function_call_output",
                                 call_id: toolCall.call_id,
-                                output: toolResult.modelOutput ?? toolResult.output,
+                                output: result.modelOutput ?? result.output,
                             });
-                            if (toolCall.name === PLAN_COMPLETE_TOOL_NAME && isPlanCompleteSelection(toolResult.details)) {
-                                planCompletion = toolResult.details;
+                            if (toolCall.name === PLAN_COMPLETE_TOOL_NAME && isPlanCompleteSelection(result.details)) {
+                                planCompletion = result.details;
                             }
                         }
 

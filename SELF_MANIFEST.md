@@ -79,6 +79,7 @@ Keep this file accurate whenever Perry's user-visible behavior, slash commands, 
 - Subagents mode is controlled by `/subagents` or Settings and defaults to disabled.
 - Subagents are not predefined modes; the main Perry agent can assign any concrete task and optional context.
 - Subagents run in an isolated model/tool loop and return a concise final report to the main agent.
+- When the main model requests multiple `spawn_subagent` tool calls in the same tool-call batch, Perry runs that contiguous subagent batch in parallel and returns results in the original call order.
 - Subagents inherit Perry's current permission mode: read-only stays read-only, workspace-write stays workspace-scoped, and full-access/YOLO auto-approves permission prompts.
 - Subagents also inherit active plan-mode restrictions, so they cannot write/edit/mutate while Perry is planning.
 - Subagents use the same current working directory and can use Perry's local tools, MCP tools, and web search subject to inherited permissions and provider/tool availability.

@@ -9,6 +9,7 @@ import {
     type PermissionMode,
 } from "./permissions";
 import { isAbortError, throwIfAborted } from "./runtimeFormatting";
+import { SPAWN_SUBAGENT_TOOL_NAME } from "./subagents";
 import type { Tool } from "../tools/types";
 import type { InteractiveUi } from "../ui/types";
 
@@ -16,12 +17,38 @@ function formatToolExecutionError(error: unknown): string {
     return error instanceof Error ? error.message : String(error);
 }
 
+type LocalFunctionCall = Extract<ResponseOutputItem, { type: "function_call" }>;
+
+export type LocalToolExecutionOptions = {
+    planMode?: boolean;
+    permissionMode?: PermissionMode;
+    getPermissionMode?: () => PermissionMode;
+    promptForPermission?: (evaluation: PermissionEvaluation) => Promise<boolean>;
+    signal?: AbortSignal;
+};
+
+export type LocalToolExecutionResult = {
+    output: string;
+    modelOutput?: ResponseInputItem.FunctionCallOutput["output"];
+    isError: boolean;
+    details?: unknown;
+};
+
+function isSpawnSubagentCall(toolCall: LocalFunctionCall | undefined): boolean {
+    return toolCall?.name === SPAWN_SUBAGENT_TOOL_NAME;
+}
+
+export type ExecutedLocalToolCall = {
+    toolCall: LocalFunctionCall;
+    result: LocalToolExecutionResult;
+};
+
 export async function executeLocalToolCall(
-    toolCall: Extract<ResponseOutputItem, { type: "function_call" }>,
+    toolCall: LocalFunctionCall,
     localTools: Array<Tool<any, any>>,
     ui: InteractiveUi,
-    options: { planMode?: boolean; permissionMode?: PermissionMode; promptForPermission?: (evaluation: PermissionEvaluation) => Promise<boolean>; signal?: AbortSignal } = {},
-): Promise<{ output: string; modelOutput?: ResponseInputItem.FunctionCallOutput["output"]; isError: boolean; details?: unknown }> {
+    options: LocalToolExecutionOptions = {},
+): Promise<LocalToolExecutionResult> {
     let args: unknown;
 
     try {
@@ -75,7 +102,7 @@ export async function executeLocalToolCall(
     }
 
     const permission = evaluateToolPermission({
-        mode: options.permissionMode ?? "ask",
+        mode: options.getPermissionMode?.() ?? options.permissionMode ?? "ask",
         toolName: tool.name,
         args,
         cwd: process.cwd(),
@@ -126,4 +153,61 @@ export async function executeLocalToolCall(
             isError: true,
         };
     }
+}
+
+export async function executeLocalToolCalls(
+    toolCalls: LocalFunctionCall[],
+    localTools: Array<Tool<any, any>>,
+    ui: InteractiveUi,
+    options: LocalToolExecutionOptions = {},
+): Promise<ExecutedLocalToolCall[]> {
+    const executed: ExecutedLocalToolCall[] = new Array(toolCalls.length);
+    let index = 0;
+
+    while (index < toolCalls.length) {
+        throwIfAborted(options.signal);
+        const current = toolCalls[index];
+        if (!current) break;
+
+        if (!isSpawnSubagentCall(current)) {
+            ui.setStatus(`Running tool: ${current.name}`);
+            const result = await executeLocalToolCall(current, localTools, ui, options);
+            throwIfAborted(options.signal);
+            executed[index] = { toolCall: current, result };
+            index += 1;
+            continue;
+        }
+
+        const startIndex = index;
+        while (index < toolCalls.length && isSpawnSubagentCall(toolCalls[index])) {
+            index += 1;
+        }
+
+        const group = toolCalls.slice(startIndex, index);
+        if (group.length === 1) {
+            const toolCall = group[0]!;
+            ui.setStatus(`Running tool: ${SPAWN_SUBAGENT_TOOL_NAME}`);
+            const result = await executeLocalToolCall(toolCall, localTools, ui, options);
+            throwIfAborted(options.signal);
+            executed[startIndex] = { toolCall, result };
+            continue;
+        }
+
+        ui.setStatus(`Running ${group.length} subagents in parallel`);
+        const groupResults = await Promise.all(group.map(async (toolCall, groupOffset) => {
+            throwIfAborted(options.signal);
+            const result = await executeLocalToolCall(toolCall, localTools, ui, options);
+            throwIfAborted(options.signal);
+            return { index: startIndex + groupOffset, toolCall, result };
+        }));
+
+        for (const groupResult of groupResults) {
+            executed[groupResult.index] = {
+                toolCall: groupResult.toolCall,
+                result: groupResult.result,
+            };
+        }
+    }
+
+    return executed;
 }
