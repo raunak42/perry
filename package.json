@@ -1,6 +1,6 @@
 {
   "name": "@perry-ai/cli",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "description": "Terminal-native coding agent with tools, planning, MCP, skills, permissions, and subagents.",
   "repository": {
     "type": "git",
