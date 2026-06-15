@@ -319,7 +319,15 @@ export function evaluateToolPermission(request: ToolPermissionRequest): Permissi
     }
 
     if (toolName === SPAWN_SUBAGENT_TOOL_NAME) {
-        return allow(mode, toolName, "subagents mode already grants permission to spawn subagents; their tools still inherit Perry permissions");
+        const task = stringArg(request.args, "task");
+        const summary = task ? `spawn subagent: ${task.slice(0, 80)}${task.length > 80 ? "..." : ""}` : "spawn subagent";
+        if (mode === "full-access") {
+            return allow(mode, toolName, "full-access mode auto-approves subagents");
+        }
+        if (mode === "ask") {
+            return ask(mode, summary, "subagent spawning requires approval in ask mode");
+        }
+        return allow(mode, toolName, "subagents inherit the current permission mode");
     }
 
     if (mode === "full-access") {

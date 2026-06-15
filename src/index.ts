@@ -1154,6 +1154,13 @@ async function main(options: CliOptions = {}) {
                             getPermissionMode: () => state.permissionMode,
                             promptForPermission: promptForPermissionApproval,
                             signal: turnSignal,
+                            onParallelSubagentsStart: (count) => {
+                                const base = planModeForTurn ? "Planning" : "Working";
+                                ui.setBusy(count === 1 ? `${base} · waiting for subagent` : `${base} · waiting for ${count} subagents`);
+                            },
+                            onParallelSubagentsEnd: () => {
+                                ui.setBusy(planModeForTurn ? "Planning" : "Working");
+                            },
                         });
 
                         for (const { toolCall, result } of executedToolCalls) {

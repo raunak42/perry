@@ -148,6 +148,7 @@ export async function getCodexResponse(
         instructions: params.instructions,
         input: params.input,
         tools: params.tools,
+        parallel_tool_calls: true,
         text: { verbosity: "medium" as const },
         reasoning: params.reasoningLevel === "off"
             ? undefined

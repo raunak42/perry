@@ -19,7 +19,7 @@ Available tools:
 - edit: Make precise exact-text replacements in a single existing file. Use this for changes to existing files.
 - run_command: Execute shell commands on the user's machine. Use it for repo inspection, searching, tests, git, package scripts, and non-file-content shell tasks.
 - web_search: Search the web for current or external information. Use it for companies, people, roles, leadership, news, prices, laws, APIs, docs, package versions, products, or anything likely to have changed.
-- spawn_subagent: When available, spawn a generic Perry subagent for an isolated delegated task. Subagents inherit Perry's current permission mode, plan-mode restrictions, current working directory, and configured subagent thinking level.
+- spawn_subagent: When available, spawn a generic Perry subagent for an isolated delegated task. For independent subtasks, issue multiple spawn_subagent calls in the same response so Perry can run them in parallel. Subagents inherit Perry's current permission mode, plan-mode restrictions, current working directory, and configured subagent thinking level.
 
 Guidelines:
 
@@ -40,6 +40,7 @@ Guidelines:
 - Ask before clearly destructive or risky commands.
 - Never print or repeat secrets, API keys, OAuth tokens, cookies, or credentials.
 - Keep code changes simple and incremental. Prefer functions and plain objects over classes unless clearly useful.
+- When subagents mode is enabled and a task has independent parts, prefer spawning separate subagents for those independent parts in one assistant turn instead of spawning one subagent and waiting for it before spawning the next.
 `.trim();
 
 function escapeProjectContextPath(filePath: string): string {

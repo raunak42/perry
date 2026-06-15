@@ -27,6 +27,8 @@ export type LocalToolExecutionOptions = {
     skipPermission?: boolean;
     autoApprovePermissionPrompts?: boolean;
     signal?: AbortSignal;
+    onParallelSubagentsStart?: (count: number) => void;
+    onParallelSubagentsEnd?: () => void;
 };
 
 export type LocalToolExecutionResult = {
@@ -188,64 +190,77 @@ export async function executeLocalToolCalls(
         }
 
         const group = toolCalls.slice(startIndex, index);
-        if (group.length === 1) {
-            const toolCall = group[0]!;
-            ui.setStatus(`Running tool: ${SPAWN_SUBAGENT_TOOL_NAME}`);
-            const result = await executeLocalToolCall(toolCall, localTools, ui, options);
-            throwIfAborted(options.signal);
-            executed[startIndex] = { toolCall, result };
-            continue;
-        }
-
-        const permission = evaluateToolPermission({
-            mode: options.getPermissionMode?.() ?? options.permissionMode ?? "ask",
-            toolName: SPAWN_SUBAGENT_TOOL_NAME,
-            args: { task: `${group.length} parallel subagents` },
-            cwd: process.cwd(),
-            planMode: !!options.planMode,
-        });
-
-        if (permission.action === "deny") {
-            const message = `Blocked by permissions: ${permission.reason}.`;
-            for (let groupOffset = 0; groupOffset < group.length; groupOffset += 1) {
-                const toolCall = group[groupOffset]!;
-                ui.showToolCall(toolCall.call_id, toolCall.name, undefined, "error", message);
-                ui.finishToolExecution(toolCall.call_id, message, true);
-                executed[startIndex + groupOffset] = { toolCall, result: { output: message, isError: true } };
-            }
-            continue;
-        }
-
-        if (permission.action === "ask" && !options.autoApprovePermissionPrompts) {
-            const approved = await options.promptForPermission?.({
-                ...permission,
-                summary: `spawn ${group.length} subagents in parallel`,
-            });
-            if (!approved) {
-                const message = `Denied by user: spawn ${group.length} subagents in parallel.`;
-                for (let groupOffset = 0; groupOffset < group.length; groupOffset += 1) {
-                    const toolCall = group[groupOffset]!;
-                    ui.showToolCall(toolCall.call_id, toolCall.name, undefined, "error", message);
-                    ui.finishToolExecution(toolCall.call_id, message, true);
-                    executed[startIndex + groupOffset] = { toolCall, result: { output: message, isError: true } };
-                }
+        const permissionResults: Array<{ toolCall: LocalFunctionCall; allowed: boolean; message?: string }> = [];
+        for (const toolCall of group) {
+            let args: unknown;
+            try {
+                throwIfAborted(options.signal);
+                args = JSON.parse(toolCall.arguments);
+            } catch (error) {
+                permissionResults.push({
+                    toolCall,
+                    allowed: false,
+                    message: `Invalid tool arguments for ${toolCall.name}: ${formatToolExecutionError(error)}`,
+                });
                 continue;
             }
+
+            const permission = evaluateToolPermission({
+                mode: options.getPermissionMode?.() ?? options.permissionMode ?? "ask",
+                toolName: SPAWN_SUBAGENT_TOOL_NAME,
+                args,
+                cwd: process.cwd(),
+                planMode: !!options.planMode,
+            });
+
+            if (permission.action === "deny") {
+                permissionResults.push({ toolCall, allowed: false, message: `Blocked by permissions: ${permission.reason}.` });
+                continue;
+            }
+
+            if (permission.action === "ask" && !options.autoApprovePermissionPrompts) {
+                const approved = await options.promptForPermission?.(permission);
+                if (!approved) {
+                    permissionResults.push({ toolCall, allowed: false, message: `Denied by user: ${permission.summary}.` });
+                    continue;
+                }
+            }
+
+            permissionResults.push({ toolCall, allowed: true });
         }
 
-        ui.setStatus(`Running ${group.length} subagents in parallel`);
-        const groupResults = await Promise.all(group.map(async (toolCall, groupOffset) => {
-            throwIfAborted(options.signal);
-            const result = await executeLocalToolCall(toolCall, localTools, ui, { ...options, skipPermission: true });
-            throwIfAborted(options.signal);
-            return { index: startIndex + groupOffset, toolCall, result };
-        }));
+        const allowedGroup = permissionResults.filter((result) => result.allowed).map((result) => result.toolCall);
+        for (let groupOffset = 0; groupOffset < group.length; groupOffset += 1) {
+            const toolCall = group[groupOffset]!;
+            const denied = permissionResults.find((result) => result.toolCall === toolCall && !result.allowed);
+            if (!denied) continue;
+            const message = denied.message ?? `Denied by user: ${toolCall.name}.`;
+            ui.showToolCall(toolCall.call_id, toolCall.name, undefined, "error", message);
+            ui.finishToolExecution(toolCall.call_id, message, true);
+            executed[startIndex + groupOffset] = { toolCall, result: { output: message, isError: true } };
+        }
 
-        for (const groupResult of groupResults) {
-            executed[groupResult.index] = {
-                toolCall: groupResult.toolCall,
-                result: groupResult.result,
-            };
+        if (allowedGroup.length === 0) continue;
+
+        const count = allowedGroup.length;
+        ui.setStatus(count === 1 ? "Waiting for subagent" : `Waiting for ${count} subagents`);
+        options.onParallelSubagentsStart?.(count);
+        try {
+            const groupResults = await Promise.all(allowedGroup.map(async (toolCall) => {
+                throwIfAborted(options.signal);
+                const result = await executeLocalToolCall(toolCall, localTools, ui, { ...options, skipPermission: true });
+                throwIfAborted(options.signal);
+                return { index: toolCalls.indexOf(toolCall), toolCall, result };
+            }));
+
+            for (const groupResult of groupResults) {
+                executed[groupResult.index] = {
+                    toolCall: groupResult.toolCall,
+                    result: groupResult.result,
+                };
+            }
+        } finally {
+            options.onParallelSubagentsEnd?.();
         }
     }
 

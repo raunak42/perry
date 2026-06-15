@@ -36,6 +36,7 @@ export async function getApiKeyResponse(
         model,
         input: agentInput,
         tools,
+        parallel_tool_calls: true,
         reasoning: getReasoningConfig(reasoningLevel),
         truncation: contextConfig.truncation,
         context_management: contextConfig.context_management,

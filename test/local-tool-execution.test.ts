@@ -81,8 +81,8 @@ test("spawn_subagent calls in the same tool batch run in parallel", async () => 
     assert.ok(elapsed < 140, `expected parallel execution to finish quickly, took ${elapsed}ms`);
 });
 
-test("ask mode subagent batches spawn without prompt and still run in parallel", async () => {
-    let permissionPrompts = 0;
+test("ask mode subagent batches ask per subagent and still run approved calls in parallel", async () => {
+    const promptedSummaries: string[] = [];
     const starts: number[] = [];
     const tools: Array<Tool<any, any>> = [
         {
@@ -102,8 +102,8 @@ test("ask mode subagent batches spawn without prompt and still run in parallel",
         makeFunctionCall("spawn_subagent", "call-b", { task: "B" }),
     ], tools, createNoopUi(), {
         permissionMode: "ask",
-        promptForPermission: async () => {
-            permissionPrompts += 1;
+        promptForPermission: async (permission) => {
+            promptedSummaries.push(permission.summary);
             return true;
         },
     });
@@ -111,10 +111,10 @@ test("ask mode subagent batches spawn without prompt and still run in parallel",
 
     assert.deepEqual(results.map((result) => result.toolCall.call_id), ["call-a", "call-b"]);
     assert.deepEqual(results.map((result) => result.result.output), ["done A", "done B"]);
-    assert.equal(permissionPrompts, 0, "enabled subagents should not need an extra spawn approval prompt");
+    assert.deepEqual(promptedSummaries, ["spawn subagent: A", "spawn subagent: B"]);
     assert.equal(starts.length, 2);
     assert.ok(Math.abs(starts[0]! - starts[1]!) < 50, `subagents did not start together: ${starts.join(", ")}`);
-    assert.ok(elapsed < 140, `expected ask-mode parallel execution without spawn approval prompt, took ${elapsed}ms`);
+    assert.ok(elapsed < 160, `expected ask-mode parallel execution after approvals, took ${elapsed}ms`);
 });
 
 test("auto-approved subagent runs skip ask prompts but still enforce denials", async () => {
@@ -202,4 +202,33 @@ test("non-subagent calls stay ordered around parallel subagent batches", async (
     assert.ok(events.indexOf("sub-start-A") > events.indexOf("first"));
     assert.ok(events.indexOf("sub-start-B") > events.indexOf("first"));
     assert.equal(events[events.length - 1], "last");
+});
+
+test("parallel subagent batches update busy status while waiting", async () => {
+    const busyMessages: string[] = [];
+    const tools: Array<Tool<any, any>> = [
+        {
+            name: "spawn_subagent",
+            definition: { type: "function", name: "spawn_subagent", parameters: {} } as any,
+            execute: async (args) => {
+                await delay(20);
+                return { output: `done ${args.task}` };
+            },
+        },
+    ];
+    const ui = {
+        ...createNoopUi(),
+        setBusy: (message?: string) => { busyMessages.push(message ?? "Working"); },
+    };
+
+    await executeLocalToolCalls([
+        makeFunctionCall("spawn_subagent", "call-a", { task: "A" }),
+        makeFunctionCall("spawn_subagent", "call-b", { task: "B" }),
+    ], tools, ui, {
+        permissionMode: "full-access",
+        onParallelSubagentsStart: (count) => ui.setBusy(`Working · waiting for ${count} subagents`),
+        onParallelSubagentsEnd: () => ui.setBusy("Working"),
+    });
+
+    assert.deepEqual(busyMessages, ["Working · waiting for 2 subagents", "Working"]);
 });
