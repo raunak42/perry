@@ -444,7 +444,7 @@ export class TerminalUi implements InteractiveUi {
 
     async choose<T = string>(prompt: string, options: ChoiceOption<T>[], initialValue?: T): Promise<T> {
         this.ensureUsable();
-        this.clearBusy();
+        this.bottomArea.clearBusyLineOnly();
         this.ensureNoActiveSession();
 
         return new Promise((resolve, reject) => {
@@ -467,6 +467,7 @@ export class TerminalUi implements InteractiveUi {
                 this.clearActiveSessionRedrawTimer();
                 this.deferActiveSessionRedraws = false;
                 teardown();
+                if (this.bottomArea.isBusyVisible) this.bottomArea.restoreBusyLine();
                 if (error) {
                     reject(error);
                     return;
@@ -1853,6 +1854,12 @@ export class TerminalUi implements InteractiveUi {
     private buildChoiceFrame<T>(prompt: string, options: ChoiceOption<T>[], selectedIndex: number): TransientFrame {
         const width = this.getTransientFrameWidth();
         const lines: string[] = [];
+        const busyStatus = this.bottomArea.getBusyStatusText();
+        const busyStatusRow = busyStatus ? lines.length : undefined;
+        if (busyStatus) {
+            lines.push(this.styleAnsi(this.fitToWidth(busyStatus, width), { fg: "#a3a3a3", dim: true }));
+            lines.push("");
+        }
         lines.push(...this.wrapPlainTextWords(prompt, width).map((line) => this.styleAnsi(line, { fg: "#d4d4d4" })));
         lines.push(this.styleAnsi(CHOICE_HINT_TEXT, { fg: "#7b8088", dim: true }));
         lines.push("");
@@ -1863,6 +1870,7 @@ export class TerminalUi implements InteractiveUi {
             cursorCol: 0,
             cursorVisible: false,
             width,
+            busyStatusRow: busyStatusRow === undefined ? undefined : busyStatusRow + (this.needsBlockSeparator ? 1 : 0),
         };
     }
 

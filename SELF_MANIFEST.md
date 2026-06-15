@@ -117,6 +117,7 @@ Keep this file accurate whenever Perry's user-visible behavior, slash commands, 
 - Committed history is retained as source data and real terminal width changes automatically reflow/replay retained history at the new width while ignoring no-op and height-only focus/resize events.
 - While output streams, the prompt may be hidden momentarily only to insert output above it, then restored immediately.
 - Busy loaders/spinners and elapsed timers should keep animating without redrawing the entire prompt frame at high frequency.
+- Busy loaders remain visible while choice/permission prompts are open during an active agent turn.
 - Tool traces show live elapsed time while running.
 - Shared choice UI is used for plan questions, settings/model/skill pickers, slash-command suggestions, and permission prompts.
 - The input prompt border uses a consistent Perry-like teal color regardless of the active reasoning/thinking level.

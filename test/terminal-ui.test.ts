@@ -1067,6 +1067,24 @@ async function assertChoiceFrameSeparatesOptionsClearly(): Promise<void> {
     );
 }
 
+async function assertChoicePromptKeepsActiveBusyLoaderVisible(): Promise<void> {
+    const raw = await captureTerminalOutput(80, 14, async (ui) => {
+        ui.setBusy("Running subagent");
+        const choice = ui.choose("Permission required", [
+            { label: "Allow once", value: "allow_once", description: "Run only this action" },
+            { label: "Deny", value: "deny", description: "Do not run this action" },
+        ]);
+        await wait(120);
+        ui.cancelActiveInput();
+        await choice.catch(() => undefined);
+        ui.clearBusy({ showWorkedLine: false });
+    });
+
+    const transcript = stripAnsi(raw).replace(/\r/g, "\n");
+    assert.match(transcript, /Running subagent · 0s/, "choice prompt should keep the active loader visible");
+    assert.equal(transcript.includes("Worked for"), false, "opening a choice should not clear busy and print a worked line");
+}
+
 async function assertChoiceFrameAlignsSessionMetadataOnTheRightWhenWidthAllows(): Promise<void> {
     const raw = await captureTerminalOutput(96, 12, async (ui) => {
         const choice = ui.choose("Resume session", [
@@ -1476,6 +1494,7 @@ test("active prompt slow streaming keeps session details visible", assertActiveP
 test("cumulative snapshot deltas do not repeat prefixes", assertCumulativeSnapshotDeltasDoNotPrintRepeatedPrefixes);
 test("streaming growth does not replay prefixes into scrollback", assertStreamingGrowthDoesNotReplayPrefixesIntoScrollback);
 test("choice frames separate options clearly", assertChoiceFrameSeparatesOptionsClearly);
+test("choice prompts keep active busy loader visible", assertChoicePromptKeepsActiveBusyLoaderVisible);
 test("choice frames keep metadata inline when width allows", assertChoiceFrameAlignsSessionMetadataOnTheRightWhenWidthAllows);
 test("choice frames style selected option turquoise and bold", assertChoiceFrameStylesSelectedOptionTurquoiseBold);
 test("choice frames style selected wrapped description turquoise and bold", assertChoiceFrameStylesSelectedWrappedDescriptionTurquoiseBold);
