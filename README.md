@@ -2,6 +2,8 @@
 
 [Perry](https://github.com/raunak42/perry) is a terminal-native coding agent with tools, planning, MCP, skills, permissions, and subagents. It ships as the npm package `@perry-ai/cli` and installs a `perry` binary.
 
+![Perry terminal preview](./assets/ansi_cutout.png)
+
 ## Why I built it?
 
 I built Perry because I wanted a fast, terminal-first coding assistant that feels native to my workflow. The goal is to keep the core loop practical: inspect files, edit code, run commands, reason through plans, use external context when needed, and preserve enough session state to continue real engineering work without turning the terminal into a heavy app.
