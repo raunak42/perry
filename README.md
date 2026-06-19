@@ -2,7 +2,7 @@
 
 [Perry](https://github.com/raunak42/perry) is a terminal-native coding agent with tools, planning, MCP, skills, permissions, and subagents. It ships as the npm package `@perry-ai/cli` and installs a `perry` binary.
 
-![Perry terminal preview](./assets/ansi_cutout.png)
+<img src="./assets/ansi_cutout.png" alt="Perry terminal preview" width="10%" />
 
 ## Why I built it?
 
